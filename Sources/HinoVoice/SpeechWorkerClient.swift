@@ -18,6 +18,13 @@ struct Transcript: Sendable {
     let stop: String
 }
 
+/// 起動する実行ファイルの差し替え。`--selftest-preview-worker` が同じバイナリを
+/// `--fake-worker <シナリオ>` で起動するためにだけ使う（設計書 9.1）。
+struct WorkerLaunch: Sendable, Equatable {
+    var executable: String
+    var arguments: [String]
+}
+
 /// worker プロセス1つを常駐させ、JSON Lines の往復を直列化する。
 actor SpeechWorkerClient {
     private struct PendingRequest {
@@ -28,6 +35,7 @@ actor SpeechWorkerClient {
     }
 
     private let onStatus: @Sendable (WorkerStatus) -> Void
+    private let launchOverride: WorkerLaunch?
 
     private var process: Process?
     private var writer: PipeWriter?
@@ -48,9 +56,14 @@ actor SpeechWorkerClient {
     /// 新しいプロセスの待機を壊さないよう、世代が現行のときだけ作用させる。
     private var launchGeneration = 0
 
-    init(onStatus: @escaping @Sendable (WorkerStatus) -> Void) {
+    init(launch: WorkerLaunch? = nil, onStatus: @escaping @Sendable (WorkerStatus) -> Void) {
+        launchOverride = launch
         self.onStatus = onStatus
     }
+
+    /// 起動した回数。プレビューの失敗で worker を作り直していないことを
+    /// `--selftest-preview-worker` から確かめる（設計書 8.2、9.2）。
+    var launchCount: Int { launchGeneration }
 
     // MARK: 常駐と再起動
 
@@ -136,12 +149,12 @@ actor SpeechWorkerClient {
     }
 
     private func launch() async throws {
-        let executable = try Self.locateExecutable()
+        let executable = try launchOverride?.executable ?? Self.locateExecutable()
         launchGeneration += 1
         let generation = launchGeneration
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = ["worker", AppConfiguration.model]
+        process.arguments = launchOverride?.arguments ?? ["worker", AppConfiguration.model]
 
         let input = Pipe()
         let output = Pipe()
@@ -459,6 +472,72 @@ actor SpeechWorkerClient {
         case .cancelled:
             throw WorkerFailure.cancelled
         }
+    }
+
+    // MARK: プレビュー専用の経路
+
+    /// プレビューごとに新しい id を作る。終端した id は再利用しないので、
+    /// 「id は終端前の要求の中で一意」という条件を自明に満たす（設計書 5.4）。
+    ///
+    /// `pending` へ登録するので、worker が落ちたときは `failAllPending` が
+    /// プレビューも畳む。
+    func newPreviewRequest() -> String {
+        let id = "p-\(UUID().uuidString)"
+        pending[id] = PendingRequest(continuation: nil, terminal: nil, lastMessage: Date())
+        return id
+    }
+
+    /// プレビュー1回ぶん。「ここまでの音声全体」を1行の `chunk` で送ってから
+    /// `transcribe` し、終端を待つ。0.25 秒ずつ分けるより送信が 3.6 倍速い
+    /// （設計書 4.2）。
+    ///
+    /// 沈黙しても worker を作り直さない。既存の `timeOut(id:)` は
+    /// `process?.terminate()` を呼ぶので、プレビューはその関数を通さない
+    /// （設計書 8.2）。プレビューの不調が録音ごと壊してはいけない。
+    func preview(id: String, pcm: Data) async throws -> String {
+        do {
+            try await write(WorkerProtocol.chunkLine(id: id, seq: 0, pcm: pcm))
+            try await write(WorkerProtocol.transcribeLine(
+                id: id,
+                sampleRate: Int(AppConfiguration.workerSampleRate),
+                language: AppConfiguration.language
+            ))
+        } catch {
+            // 書けなかった id は終端を待たない。表に残すと worker の作り直しまで
+            // 居座る。書き込みの失敗そのものは既存の `write` が扱う（設計書 8.2）。
+            pending.removeValue(forKey: id)
+            throw error
+        }
+        touch(id)
+        let watchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self else { return }
+                if await self.silentSeconds(for: id) > AppConfiguration.previewIdleTimeoutSeconds {
+                    await self.timeOutPreview(id: id)
+                    return
+                }
+            }
+        }
+        defer { watchdog.cancel() }
+
+        switch try await waitTerminal(id: id) {
+        case let .end(text, _):
+            return text
+        case let .failed(code, message):
+            throw WorkerFailure.workerError(code: code, message: message)
+        case .cancelled:
+            throw WorkerFailure.cancelled
+        }
+    }
+
+    /// プレビューが沈黙した。その id へ `cancel` を送って失敗にするが、worker は
+    /// 作り直さない（設計書 8.2）。
+    private func timeOutPreview(id: String) async {
+        Log.worker.debug("preview timed out")
+        // 先に待ち側を解放する。`write` が詰まっていても次のラウンドへ進める。
+        deliver(id: id, .failure(WorkerFailure.timeout("preview")))
+        try? await write(WorkerProtocol.cancelLine(id: id))
     }
 
     /// Esc で取り消す。文書のとおり `transcribe` は送らない（設計書 12.5）。

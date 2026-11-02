@@ -154,8 +154,16 @@ final class AudioCapture: @unchecked Sendable {
     private let onChunk: @Sendable (Data) -> Void
     private let chunkBytes = Int(AppConfiguration.workerSampleRate * AppConfiguration.chunkSeconds) * 2
 
+    /// プレビューは毎回「ここまでの音声全体」を送り直す。プロトコル上これ以外の
+    /// 方法はない（設計書 4.2）ので、変換後の PCM をここに溜める。固定長で持ち、
+    /// base64 文字列は毎回作り直して使い捨てる。保持すると 2.56 MB が常駐する。
+    private let recordedCap = Int(
+        AppConfiguration.workerSampleRate * AppConfiguration.maxRecordingSeconds
+    ) * 2
+
     private var resampler: AudioResampler?
     private var pending = Data()
+    private var recorded = Data()
     private var convertedBytes = 0
 
     init(onChunk: @escaping @Sendable (Data) -> Void) {
@@ -169,6 +177,20 @@ final class AudioCapture: @unchecked Sendable {
         return Double(convertedBytes) / 2 / AppConfiguration.workerSampleRate
     }
 
+    /// ここまでの音声全体。プレビューの1ラウンドぶんの入力になる（設計書 4.2）。
+    ///
+    /// バッファを共有して返すと、次の `append` で Data が写しを作る。その写しは
+    /// オーディオスレッドで起きるので、ここで先に取り切って `recorded` の参照を
+    /// 1つに保つ。確保しておいた容量も維持される。
+    func snapshot() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !recorded.isEmpty else { return Data() }
+        return recorded.withUnsafeBytes { bytes in
+            Data(bytes: bytes.baseAddress!, count: bytes.count)
+        }
+    }
+
     func start() throws {
         let input = engine.inputNode
         // 形式は環境によって変わるので固定値にしない（設計書 11）。
@@ -178,6 +200,8 @@ final class AudioCapture: @unchecked Sendable {
         lock.lock()
         resampler = try? AudioResampler(inputFormat: format)
         pending = Data()
+        recorded = Data()
+        recorded.reserveCapacity(recordedCap)
         convertedBytes = 0
         let ready = resampler != nil
         lock.unlock()
@@ -205,11 +229,12 @@ final class AudioCapture: @unchecked Sendable {
         engine.inputNode.removeTap(onBus: 0)
         lock.lock()
         defer { lock.unlock() }
+        // 変換器に残った分は、まだ `recorded` に入っていない。
+        let flushed = resampler?.flush() ?? Data()
         var tail = pending
-        if let resampler {
-            tail.append(resampler.flush())
-        }
-        convertedBytes += tail.count - pending.count
+        tail.append(flushed)
+        convertedBytes += flushed.count
+        appendRecordedLocked(flushed)
         pending = Data()
         resampler = nil
         return tail
@@ -223,6 +248,7 @@ final class AudioCapture: @unchecked Sendable {
         }
         let converted = resampler.convert(buffer)
         pending.append(converted)
+        appendRecordedLocked(converted)
         convertedBytes += converted.count
         var chunks: [Data] = []
         while pending.count >= chunkBytes {
@@ -232,6 +258,17 @@ final class AudioCapture: @unchecked Sendable {
         lock.unlock()
         for chunk in chunks {
             onChunk(chunk)
+        }
+    }
+
+    /// 蓄積は 60 秒ぶんで打ち切る。録音は `limitTask` が 60 秒で止めるので
+    /// ここに届くのはタップの行き過ぎ分だけだが、上限を型で持たせておく。
+    /// 呼び出し側が `lock` を持っていること。
+    private func appendRecordedLocked(_ converted: Data) {
+        guard !converted.isEmpty else { return }
+        recorded.append(converted)
+        if recorded.count > recordedCap {
+            recorded.removeFirst(recorded.count - recordedCap)
         }
     }
 }
