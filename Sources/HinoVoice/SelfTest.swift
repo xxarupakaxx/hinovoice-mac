@@ -33,6 +33,8 @@ enum SelfTest {
             return previewWindow()
         case "--selftest-preview-place":
             return previewPlace()
+        case "--selftest-preview-send":
+            return blocking { await previewSend() }
         case "--selftest-preview-worker":
             return blocking { await previewWorker() }
         default:
@@ -42,7 +44,7 @@ enum SelfTest {
                 + " | --selftest-worker <in.wav>"
                 + " | --selftest-prefix | --selftest-preview-schedule"
                 + " | --selftest-preview-window | --selftest-preview-place"
-                + " | --selftest-preview-worker")
+                + " | --selftest-preview-send | --selftest-preview-worker")
             return 2
         }
     }
@@ -907,6 +909,82 @@ enum SelfTest {
         return failures == 0 ? 0 : 1
     }
 
+    // MARK: プレビューの送信キュー
+
+    /// 送信待ちのプレビューは期限で捨てられ、書き始めた行は切られない
+    /// （レビュー MUST 1、2）。読み手のいないパイプで詰まりを作るので、固定の
+    /// 待ち時間を使わずに順序を決められる。
+    private static func previewSend() async -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+        func code(_ error: Error) -> String { SpeechWorkerClient.code(of: error) }
+
+        let pipe = Pipe()
+        let writer = PipeWriter(handle: pipe.fileHandleForWriting)
+        // パイプのバッファ（64KB 程度）より大きい行。読み手が読むまで書き終わらない。
+        let big = Data(repeating: UInt8(ascii: "A"), count: 512 * 1024)
+
+        let blocked = writer.enqueue(big)
+        // 1件目が詰まっているあいだ、2件目は順番待ちのまま期限を迎える。
+        let waiting = writer.enqueue(Data(repeating: UInt8(ascii: "B"), count: 16))
+        waiting.expire()
+        var dropped = ""
+        do {
+            try await waiting.wait()
+        } catch {
+            dropped = code(error)
+        }
+        check(dropped == "timeout_preview_send", "順番待ちの送信は期限で捨てる（\(dropped)）")
+
+        // 1件目が書き始めていることを、読めたバイトで確かめる。
+        var received = pipe.fileHandleForReading.availableData
+        check(!received.isEmpty, "1件目は書き始めている")
+        // 書き込み中の行は期限では捨てない。途中で切ると JSON の行が壊れる。
+        blocked.expire()
+        while received.count < big.count {
+            let chunk = pipe.fileHandleForReading.availableData
+            if chunk.isEmpty { break }
+            received.append(chunk)
+        }
+        do {
+            try await blocked.wait()
+            check(true, "書き始めた行は期限を過ぎても最後まで書く")
+        } catch {
+            check(false, "書き始めた行は期限を過ぎても最後まで書く（\(code(error))）")
+        }
+        check(received.count == big.count, "捨てた行のバイトは混ざらない（\(received.count)/\(big.count)）")
+        check(received.allSatisfy { $0 == UInt8(ascii: "A") }, "受け取ったのは書き始めた行だけ")
+
+        // 積んだ順に書く。行の途中へ別の書き込みは割り込まない。
+        let first = writer.enqueue(Data("1111\n".utf8))
+        let second = writer.enqueue(Data("2222\n".utf8))
+        do {
+            try await first.wait()
+            try await second.wait()
+            let ordered = pipe.fileHandleForReading.readData(ofLength: 10)
+            check(ordered == Data("1111\n2222\n".utf8), "積んだ順に書く")
+        } catch {
+            check(false, "積んだ順に書く（\(code(error))）")
+        }
+
+        // 閉じたあとの予約は書かずに失敗する。
+        writer.close()
+        var afterClose = ""
+        do {
+            try await writer.enqueue(Data("3333\n".utf8)).wait()
+        } catch {
+            afterClose = code(error)
+        }
+        check(afterClose == "not_running", "閉じたあとは送らない（\(afterClose)）")
+        try? pipe.fileHandleForReading.close()
+
+        print(failures == 0 ? "プレビューの送信キュー: 全件 ok" : "プレビューの送信キュー: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
     // MARK: 偽 worker との往復
 
     /// プレビューが最終を壊さないことを、実 worker もモデルも使わずに確かめる
@@ -1056,6 +1134,74 @@ enum SelfTest {
             await worker.shutdown()
         } catch {
             print("  FAIL preview-silent: \(SpeechWorkerClient.message(of: error))")
+            failures += 1
+        }
+
+        // (e) 初回の chunk を送る前の取消。worker は知らない id への cancel を
+        // 無視するので、後着の chunk で認識を始めてしまう。取消の確認と送信を
+        // 直列にしていれば1バイトも送らない（レビュー MUST 1）。偽 worker は
+        // 取消済み id の chunk を違反として記録し、最終を error で返す。
+        print("--- cancel-before-send ---")
+        do {
+            let worker = client(.serial)
+            try await worker.startOnce()
+            let finalID = await worker.newRequest()
+            try await worker.send(chunk: pcm, id: finalID, seq: 0)
+
+            let previewID = await worker.newPreviewRequest()
+            await worker.cancel(id: previewID)
+            var code = ""
+            do {
+                _ = try await worker.preview(id: previewID, pcm: pcm)
+            } catch {
+                code = SpeechWorkerClient.code(of: error)
+            }
+            check(code == "cancelled", "取消済みのプレビューは送らない（\(code)）")
+
+            let transcript = try await worker.transcribe(id: finalID)
+            check(!transcript.text.isEmpty, "worker はプレビューを受け取っていないので最終が end を返す")
+            let launches = await worker.launchCount
+            check(launches == 1, "worker を作り直していない（\(launches) 回起動）")
+            await worker.shutdown()
+        } catch {
+            print("  FAIL cancel-before-send: \(SpeechWorkerClient.message(of: error))")
+            failures += 1
+        }
+
+        // (f) 送信中の取消。どの順で割り込んでも、worker が受け取る行は
+        // `chunk` → `transcribe` → `cancel` の順になる。行のあいだへ cancel が
+        // 入れば偽 worker が違反として記録し、最終が error になる（レビュー MUST 1、2）。
+        print("--- cancel-during-send ---")
+        do {
+            let worker = client(.serial)
+            try await worker.startOnce()
+            let finalID = await worker.newRequest()
+            try await worker.send(chunk: pcm, id: finalID, seq: 0)
+
+            // パイプのバッファより大きい送信にして、書き込み中に取消を当てる。
+            let large = Data(count: Int(AppConfiguration.workerSampleRate) * 2 * 20)
+            let previewID = await worker.newPreviewRequest()
+            let running = Task { try await worker.preview(id: previewID, pcm: large) }
+            await Task.yield()
+            await worker.cancel(id: previewID)
+
+            var code = ""
+            do {
+                _ = try await running.value
+            } catch {
+                code = SpeechWorkerClient.code(of: error)
+            }
+            check(
+                code == "cancelled" || code == "terminated",
+                "送信中に取消したプレビューは結果を返さない（\(code)）"
+            )
+            let transcript = try await worker.transcribe(id: finalID)
+            check(!transcript.text.isEmpty, "行が割れていないので最終が end を返す")
+            let launches = await worker.launchCount
+            check(launches == 1, "送信中の取消で worker を作り直さない（\(launches) 回起動）")
+            await worker.shutdown()
+        } catch {
+            print("  FAIL cancel-during-send: \(SpeechWorkerClient.message(of: error))")
             failures += 1
         }
 

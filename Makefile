@@ -119,6 +119,8 @@ selftest: build
 	"$(BIN)" --selftest-preview-window
 	@echo "--- プレビューの位置（AX 座標の変換と画面への寄せ） ---"
 	"$(BIN)" --selftest-preview-place
+	@echo "--- プレビューの送信キュー（期限で捨てる、行は切らない） ---"
+	"$(BIN)" --selftest-preview-send
 	@echo "--- 偽 worker との往復（プレビューが最終を壊さない） ---"
 	"$(BIN)" --selftest-preview-worker
 	@echo "--- speech worker との往復 ---"

@@ -61,9 +61,15 @@ private final class FakeWorkerSession: @unchecked Sendable {
     private var running: Set<String> = []
     private var cancelled: Set<String> = []
     private var finished: Set<String> = []
+    private var transcribed: Set<String> = []
+    /// 知らない id への `cancel`。実 worker と同じく無視するが、そのあとで同じ
+    /// id の `chunk` が来たら取消が効かなかったことになる（レビュー MUST 1）。
+    private var cancelledBeforeChunk: Set<String> = []
     /// `serial` シナリオだけが使う。プレビューが畳まれる前に最終の
     /// `transcribe` が来たら、順序の違反として最終を `error` で返す。
     private var previewInFlight: String?
+    /// 検出した順序の違反。最終を `error` で返して検査側へ知らせる。
+    private var violation: String?
     private var scriptIndex = 0
 
     init(scenario: FakeWorker.Scenario) {
@@ -100,8 +106,10 @@ private final class FakeWorkerSession: @unchecked Sendable {
 
         switch type {
         case "chunk":
+            noteChunk(id)
             note(id)
         case "transcribe":
+            noteTranscribe(id)
             note(id)
             if Self.isPreview(id) {
                 startPreview(id)
@@ -129,6 +137,20 @@ private final class FakeWorkerSession: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    /// 取消したはずのプレビューの `chunk` が来た。取消の確認と送信が直列になって
+    /// いないと起きる（レビュー MUST 1）。
+    private func noteChunk(_ id: String) {
+        stateLock.lock()
+        if cancelledBeforeChunk.contains(id) { violation = violation ?? "cancel_before_chunk" }
+        stateLock.unlock()
+    }
+
+    private func noteTranscribe(_ id: String) {
+        stateLock.lock()
+        transcribed.insert(id)
+        stateLock.unlock()
+    }
+
     private func startPreview(_ id: String) {
         guard scenario != .previewSilent else {
             // 答えない。直列キューにも載せないので、最終は待たされない。
@@ -144,14 +166,18 @@ private final class FakeWorkerSession: @unchecked Sendable {
 
     private func startFinal(_ id: String) {
         stateLock.lock()
-        let violation = scenario == .serial && previewInFlight != nil
-        if violation { finished.insert(id) }
+        var code: String?
+        if scenario == .serial {
+            code = previewInFlight != nil ? "preview_not_cancelled" : violation
+        }
+        if code != nil { finished.insert(id) }
         stateLock.unlock()
 
-        guard !violation else {
-            // プレビューを畳む前に最終の `transcribe` が来た。設計書 5.3 の順序が
-            // 崩れていれば、ここで最終が落ちる。
-            send(error: id, code: "preview_not_cancelled")
+        guard code == nil else {
+            // プレビューを畳む前に最終の `transcribe` が来た、または取消と送信の
+            // 順序が崩れた。設計書 5.3 とレビュー MUST 1 の順序が成立していない
+            // ことを、最終の失敗として検査側へ知らせる。
+            send(error: id, code: code ?? "unknown")
             return
         }
         perform(id: id, seconds: 0.05, errorCode: nil, text: Self.finalText)
@@ -160,9 +186,15 @@ private final class FakeWorkerSession: @unchecked Sendable {
     private func cancel(_ id: String) {
         stateLock.lock()
         if previewInFlight == id { previewInFlight = nil }
+        if Self.isPreview(id), seen.contains(id), !transcribed.contains(id), !finished.contains(id) {
+            // `chunk` と `transcribe` のあいだへ `cancel` が割り込んだ。実 worker は
+            // ここで要求を畳むので、後着の `transcribe` は宛先を失う（レビュー MUST 1）。
+            violation = violation ?? "cancel_between_lines"
+        }
         guard !finished.contains(id), seen.contains(id) else {
             // 終端済み、または知らない id への `cancel` は無視する
             // （worker-protocol.md:79）。
+            if Self.isPreview(id), !seen.contains(id) { cancelledBeforeChunk.insert(id) }
             stateLock.unlock()
             return
         }
