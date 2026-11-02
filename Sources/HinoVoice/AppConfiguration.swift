@@ -68,4 +68,12 @@ enum AppConfiguration {
     /// ショートカットになる（OpenHinoVoice src/paste.rs:175-181 と同じ理由）。
     static let modifierReleaseWaitSeconds = 0.5
     static let modifierPollSeconds = 0.02
+
+    /// フォーカス要素の問い合わせに使う属性名。`kAXFocusedUIElementAttribute` は
+    /// 可変のグローバルとして import されるため Swift 6 では参照できない。
+    static let axFocusedUIElementAttribute = "AXFocusedUIElement"
+
+    /// アクセシビリティの問い合わせの待ち時間。応答しないアプリで貼り付けが
+    /// 固まらないようにする。
+    static let axMessagingTimeoutSeconds = 0.2
 }

@@ -10,6 +10,32 @@ struct MenuPresentation: Equatable {
     var showsAccessibilityHelp: Bool
 }
 
+/// 1回の録音の世代。Esc と認識完了は競合しうるので、取り消しは `invalidate()`
+/// で世代を進め、`await` の再開地点ごとに `isCurrent(_:)` で照合する。これを
+/// 怠ると、取り消したあとに届いた結果を貼り付け、古い処理の後始末が新しい
+/// セッションを消す（設計書 9）。`--selftest-session` で検証する。
+struct SessionGeneration: Equatable {
+    private var value = 0
+
+    /// いま有効な世代。進行中のセッションを引き継ぐ側が読む。
+    var current: Int { value }
+
+    /// 新しいセッションを始め、その世代を返す。
+    mutating func begin() -> Int {
+        value += 1
+        return value
+    }
+
+    /// 取り消し。進行中のどの世代とも一致しなくなる。
+    mutating func invalidate() {
+        value += 1
+    }
+
+    func isCurrent(_ session: Int) -> Bool {
+        value == session
+    }
+}
+
 /// 状態遷移を行うのはこの型だけ（設計書 9）。
 @MainActor
 final class RecordingCoordinator {
@@ -61,6 +87,14 @@ final class RecordingCoordinator {
     private var limitTask: Task<Void, Never>?
     private var tapInstalled = false
 
+    private var generation = SessionGeneration()
+    /// 開始処理が走っている間。マイクの許可待ちと `newRequest` の待ちの間も
+    /// 状態は idle のままなので、これがないと開始処理が二重に入る。
+    private var isStarting = false
+    /// 貼り付けが進んでいる間。終了処理はクリップボードの復元を待つ。
+    private var isPasting = false
+    private var pasteWaiters: [CheckedContinuation<Void, Never>] = []
+
     var onPresentation: ((MenuPresentation) -> Void)?
 
     init() {
@@ -109,7 +143,16 @@ final class RecordingCoordinator {
 
     func shutdown() async {
         limitTask?.cancel()
+        limitTask = nil
         _ = capture?.stop()
+        capture = nil
+        // 400ms の復元待ちの途中で終わらせると、元のクリップボードを戻せない。
+        // 貼り付けが終わってから worker を止める。
+        if isPasting {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                pasteWaiters.append(continuation)
+            }
+        }
         await worker.shutdown()
     }
 
@@ -125,7 +168,7 @@ final class RecordingCoordinator {
             }
         case .cancel:
             if state == .recording || state == .transcribing {
-                Task { await cancelSession() }
+                cancelSession()
             }
         }
     }
@@ -133,7 +176,7 @@ final class RecordingCoordinator {
     // MARK: 遷移
 
     private func beginRecording() async {
-        guard state.acceptsStartKey else { return }
+        guard !isStarting, state.acceptsStartKey else { return }
         if case let .unavailable(reason) = state {
             show(notice: reason)
             return
@@ -142,18 +185,32 @@ final class RecordingCoordinator {
             show(notice: statusText(for: workerStatus))
             return
         }
+
+        // ここから最初の await までの間に予約する。開始キーの連打でも、
+        // capture・requestID・制限時間タスクを上書きさせない。
+        isStarting = true
+        defer { isStarting = false }
+        let session = generation.begin()
+
         guard await Permissions.requestMicrophone() else {
             show(notice: "マイクの許可がありません")
             return
         }
+        guard isCurrent(session), state.acceptsStartKey else { return }
         guard Permissions.isAccessibilityTrusted else {
             show(notice: "アクセシビリティの許可がありません")
             Permissions.promptAccessibility()
             return
         }
 
-        target = PasteTarget.current()
+        let target = PasteTarget.current()
         let id = await worker.newRequest()
+        guard isCurrent(session), state.acceptsStartKey, workerStatus == .ready else {
+            await worker.cancel(id: id)
+            return
+        }
+
+        self.target = target
         requestID = id
         let sender = ChunkSender(worker: worker, requestID: id)
         self.sender = sender
@@ -163,9 +220,11 @@ final class RecordingCoordinator {
         do {
             try capture.start()
         } catch {
-            await worker.cancel(id: id)
             requestID = nil
+            sender.stop()
             self.sender = nil
+            self.target = nil
+            await worker.cancel(id: id)
             let message = (error as? AudioFailure)?.userMessage ?? "録音を開始できません"
             Log.audio.error("capture start failed")
             show(notice: message)
@@ -183,6 +242,7 @@ final class RecordingCoordinator {
 
     private func stopAndTranscribe() async {
         guard state == .recording, let id = requestID, let capture else { return }
+        let session = generation.current
         limitTask?.cancel()
         limitTask = nil
         let tail = capture.stop()
@@ -197,7 +257,14 @@ final class RecordingCoordinator {
         let started = Date()
         do {
             await sender?.finish(tail)
+            // Esc は await の前に世代を無効化する。再開地点ごとに照合して、
+            // 取り消したあとの結果を貼らない。
+            guard isCurrent(session) else { return }
             let transcript = try await worker.transcribe(id: id)
+            guard isCurrent(session) else {
+                Log.state.notice("transcript dropped; session already cancelled")
+                return
+            }
             let elapsed = Date().timeIntervalSince(started)
             Log.worker.notice("""
             end received in \(elapsed, privacy: .public) s, \
@@ -206,9 +273,13 @@ final class RecordingCoordinator {
             """)
             requestID = nil
             sender = nil
+            // 貼り付けの予約は await を挟む前に済ませる。`paste` の中で印を
+            // 付けると、その呼び出しの中断中に終了処理が通り抜けられる。
+            beginPaste()
             // 段階2の AI 整形はこの1行の前に入る（設計書 15）。
-            await paste(transcript.text)
+            await paste(transcript.text, session: session)
         } catch {
+            guard isCurrent(session) else { return }
             requestID = nil
             sender = nil
             let failure = error as? WorkerFailure
@@ -222,28 +293,59 @@ final class RecordingCoordinator {
         }
     }
 
-    private func paste(_ text: String) async {
+    /// 貼り付けを予約する。終了処理はここからクリップボードの復元までを待つ。
+    private func beginPaste() {
+        isPasting = true
         transition(to: .pasting)
+    }
+
+    private func paste(_ text: String, session: Int) async {
+        let target = self.target
+        self.target = nil
         let outcome = await TextInserter.insert(text, into: target)
-        target = nil
+        isPasting = false
+        releasePasteWaiters()
+        // 貼り付け中は開始も取り消しも受けないので、ここで世代が変わるのは
+        // 想定外である。変わっていれば状態はすでに待機中に戻っている。
+        guard isCurrent(session) else { return }
         if let message = outcome.userMessage {
             show(notice: message)
         }
         transition(to: .idle)
     }
 
-    private func cancelSession() async {
+    /// 取り消しの同期部分。`await` を1つも含まないので、呼び出し元へ戻った
+    /// 時点で古いセッションの結果は貼られない。
+    private func invalidateSession() -> String? {
+        generation.invalidate()
         limitTask?.cancel()
         limitTask = nil
         _ = capture?.stop()
         capture = nil
-        if let id = requestID {
-            await worker.cancel(id: id)
-        }
-        requestID = nil
+        sender?.stop()
         sender = nil
         target = nil
+        let id = requestID
+        requestID = nil
         transition(to: .idle)
+        return id
+    }
+
+    private func cancelSession() {
+        guard let id = invalidateSession() else { return }
+        Task { [worker] in await worker.cancel(id: id) }
+    }
+
+    private func isCurrent(_ session: Int) -> Bool {
+        generation.isCurrent(session)
+    }
+
+    private func releasePasteWaiters() {
+        let waiters = pasteWaiters
+        pasteWaiters = []
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 
     private func transition(to next: State) {
@@ -268,7 +370,7 @@ final class RecordingCoordinator {
             // 解除するために、ここで必ず待機中へ戻す（設計書 9）。
             if state == .recording || state == .transcribing {
                 show(notice: reason)
-                Task { await cancelSession() }
+                cancelSession()
             }
         case .starting, .preparingModel:
             break

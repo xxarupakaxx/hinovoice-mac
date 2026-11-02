@@ -15,16 +15,12 @@ struct TapState: Sendable, Equatable {
     var swallowsConfirmKeys = false
     /// 待機中と停止中だけ開始キーを受ける。
     var acceptsStartKey = true
-    /// keyDown を飲み込んだキー。対応する keyUp も飲み込んで、アプリに片側だけ
-    /// 届かないようにする（OpenHinoVoice src/hook.rs:31-57 と同じ役割）。
-    var captured: CapturedKeys = []
-}
-
-struct CapturedKeys: OptionSet, Sendable {
-    let rawValue: UInt8
-    static let start = CapturedKeys(rawValue: 1 << 0)
-    static let confirm = CapturedKeys(rawValue: 1 << 1)
-    static let cancel = CapturedKeys(rawValue: 1 << 2)
+    /// keyDown を飲み込んだ物理キーのキーコード。対応する keyUp も飲み込んで、
+    /// アプリに片側だけ届かないようにする（OpenHinoVoice src/hook.rs:31-57 と
+    /// 同じ役割）。役割ではなくキーコードで持つので、⌃⌥Space のあと Control を
+    /// 先に離して Space の役割が変わっても keyUp を取りこぼさず、Return と
+    /// テンキーの Enter も互いに干渉しない。
+    var capturedKeyCodes: Set<Int64> = []
 }
 
 /// コールバックが見るキー入力。CGEvent から取り出した値だけにして、
@@ -61,43 +57,41 @@ enum KeyPolicy {
 
     /// 飲み込むかどうかと、状態機械へ送るイベントを決める。副作用はない。
     static func decide(_ input: KeyInput, state: inout TapState) -> KeyDecision {
-        let key: CapturedKeys
+        // keyUp は現在の修飾キーの状態ではなく、押下を飲み込んだキーコードで
+        // 照合する。役割で照合すると、⌃⌥Space のあと Control や Option を先に
+        // 離した Space が `.other` になり、keyUp だけがアプリへ漏れる。
+        guard input.isKeyDown else {
+            let swallow = state.capturedKeyCodes.contains(input.keyCode)
+            state.capturedKeyCodes.remove(input.keyCode)
+            return KeyDecision(swallow: swallow, event: nil)
+        }
+
+        if state.capturedKeyCodes.contains(input.keyCode) {
+            // 押しっぱなしの繰り返しで二度目の遷移を起こさない
+            // （OpenHinoVoice src/hook.rs:33-36）。
+            return KeyDecision(swallow: true, event: nil)
+        }
+
         let active: Bool
         let event: HotkeyEvent
         switch role(of: input) {
         case .start:
-            key = .start
             active = state.acceptsStartKey
             event = .start
         case .confirm:
-            key = .confirm
             active = state.swallowsConfirmKeys
             event = .confirm
         case .cancel:
-            key = .cancel
             active = state.swallowsConfirmKeys
             event = .cancel
         case .other:
             return KeyDecision(swallow: false, event: nil)
         }
 
-        guard input.isKeyDown else {
-            // 押下を飲み込んだキーは、離したときも飲み込む。
-            let swallow = state.captured.contains(key)
-            state.captured.remove(key)
-            return KeyDecision(swallow: swallow, event: nil)
-        }
-
-        if input.isRepeat || state.captured.contains(key) {
-            // 押しっぱなしの繰り返しで二度目の遷移を起こさない
-            // （OpenHinoVoice src/hook.rs:33-36）。
-            return KeyDecision(swallow: state.captured.contains(key), event: nil)
-        }
-
-        guard active else {
+        guard active, !input.isRepeat else {
             return KeyDecision(swallow: false, event: nil)
         }
-        state.captured.insert(key)
+        state.capturedKeyCodes.insert(input.keyCode)
         return KeyDecision(swallow: true, event: event)
     }
 }
