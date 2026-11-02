@@ -89,6 +89,11 @@ enum AppConfiguration {
     static let previewIdleTimeoutSeconds = 3.0
     /// これだけ連続で失敗したら、その録音のプレビューを止める（設計書 8.2）。
     static let maxConsecutivePreviewFailures = 3
+    /// プレビューの送信が書き始めるまでの上限。これを過ぎた分は1バイトも書かずに
+    /// 捨てる。最大 2.56MB の送信を `writeTimeoutSeconds` まで待って worker を
+    /// 止める経路へ流さないための値である（レビュー MUST 2）。間隔の下限と同じ
+    /// 1 秒にして、次のラウンドまでに必ず片付く形にする。
+    static let previewSendBudgetSeconds = 1.0
     /// これより短い蓄積ではラウンドを作らない。
     static let previewMinimumSeconds = 0.5
 

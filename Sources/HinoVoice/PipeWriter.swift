@@ -2,6 +2,73 @@ import Darwin
 import Foundation
 import os
 
+/// 書き込み1件の予約。`PipeWriter` の直列キューへ積んだ順に書く。
+///
+/// 書き始める前なら `expire()` で捨てられる。書き始めたあとは捨てられない。
+/// JSON の行を途中で切ると worker の読み取りがずれるので、始めた行は最後まで
+/// 書く（レビュー MUST 2）。
+final class PipeWrite: @unchecked Sendable {
+    private enum Phase {
+        case queued
+        case writing
+        case done
+    }
+
+    private let lock = NSLock()
+    private var phase = Phase.queued
+    private var result: Result<Void, Error>?
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    /// キューの順番が来た。期限で捨てられていれば `false` を返す。呼び出し側は
+    /// そのとき1バイトも書かない。
+    func begin() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard phase == .queued else { return false }
+        phase = .writing
+        return true
+    }
+
+    /// 書き始めるまでの期限。まだ順番待ちなら捨てる。書き込み中なら何もしない。
+    func expire() {
+        settle(from: .queued, with: .failure(WorkerFailure.timeout("preview_send")))
+    }
+
+    /// 書き終わった、または書けなかった。
+    func finish(_ result: Result<Void, Error>) {
+        settle(from: .writing, with: result)
+    }
+
+    /// 結果を待つ。待たずに捨ててもよい（継続を入れていなければ結果を預かるだけ）。
+    func wait() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(with: result)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    /// 1件の予約は1回だけ確定する。継続の再開はロックの外で行う。
+    private func settle(from expected: Phase, with result: Result<Void, Error>) {
+        lock.lock()
+        guard phase == expected else {
+            lock.unlock()
+            return
+        }
+        phase = .done
+        self.result = result
+        let waiting = continuation
+        continuation = nil
+        lock.unlock()
+        waiting?.resume(with: result)
+    }
+}
+
 /// 標準入力への書き込みを専用の直列キューで行う。actor やオーディオスレッドを
 /// ブロックしないため、書き込みはすべてここを通す（設計書 12.6）。
 ///
@@ -49,8 +116,30 @@ final class PipeWriter: @unchecked Sendable {
         }
     }
 
+    /// 直列キューへ積む。積んだ順に書き、1行の途中へ別の書き込みを割り込ませない。
+    /// 積むところまでは同期なので、呼び出し側は他の書き込みとの順序を `await` を
+    /// 挟まずに決められる（レビュー MUST 1）。
+    ///
+    /// 書き始めるまでの期限は呼び出し側が `PipeWrite.expire()` で掛ける。書き
+    /// 始めたあとは期限で切らない。読み手が消えれば `poll` が POLLHUP を返し、
+    /// `close()` でも抜けるので、待ち続けることはない（レビュー MUST 2）。
+    func enqueue(_ data: Data) -> PipeWrite {
+        let write = PipeWrite()
+        queue.async { [self] in
+            guard write.begin() else { return }
+            do {
+                try writeAll(data, deadline: nil)
+                write.finish(.success(()))
+            } catch {
+                write.finish(.failure(error))
+            }
+        }
+        return write
+    }
+
     /// 非ブロッキングなので部分書き込みが起きる。全部書けるまで繰り返す。
-    private func writeAll(_ data: Data, deadline: Date) throws {
+    /// `deadline` が `nil` のときは、書き終わるかパイプが壊れるまで待つ。
+    private func writeAll(_ data: Data, deadline: Date?) throws {
         guard !closed.withLock({ $0 }) else { throw WorkerFailure.notRunning }
         try data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
@@ -76,12 +165,15 @@ final class PipeWriter: @unchecked Sendable {
 
     /// 書けるようになるか、期限が来るか、`close()` されるまで待つ。短く区切って
     /// 待つことで、終了処理がこのキューの後ろで止まらないようにする。
-    private func waitWritable(until deadline: Date) throws {
+    private func waitWritable(until deadline: Date?) throws {
         while true {
             guard !closed.withLock({ $0 }) else { throw WorkerFailure.notRunning }
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else { throw WorkerFailure.timeout("write") }
-            let slice = Int32((min(remaining, AppConfiguration.writePollSliceSeconds) * 1000).rounded(.up))
+            var slice = Int32((AppConfiguration.writePollSliceSeconds * 1000).rounded(.up))
+            if let deadline {
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else { throw WorkerFailure.timeout("write") }
+                slice = Int32((min(remaining, AppConfiguration.writePollSliceSeconds) * 1000).rounded(.up))
+            }
             var target = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
             let ready = poll(&target, 1, slice)
             if ready < 0 {

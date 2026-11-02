@@ -491,21 +491,24 @@ actor SpeechWorkerClient {
     /// `transcribe` し、終端を待つ。0.25 秒ずつ分けるより送信が 3.6 倍速い
     /// （設計書 4.2）。
     ///
-    /// 沈黙しても worker を作り直さない。既存の `timeOut(id:)` は
-    /// `process?.terminate()` を呼ぶので、プレビューはその関数を通さない
-    /// （設計書 8.2）。プレビューの不調が録音ごと壊してはいけない。
+    /// 沈黙しても、送信が詰まっても worker を作り直さない。既存の `timeOut(id:)`
+    /// と `write(_:)` は `process?.terminate()` を呼ぶので、プレビューはどちらの
+    /// 関数も通さず、`PipeWriter.enqueue` で積む（設計書 8.2、レビュー MUST 2）。
+    /// プレビューの不調が録音ごと壊してはいけない。
     func preview(id: String, pcm: Data) async throws -> String {
+        // 取消の確認と送信の予約のあいだに `await` を置かない。actor は `await` の
+        // 地点で再入するので、ここで中断すると `cancel(id:)` が先に走り、worker は
+        // 知らない id への cancel を無視したあと、後着の chunk で認識を始める
+        // （レビュー MUST 1）。
         do {
-            try await write(WorkerProtocol.chunkLine(id: id, seq: 0, pcm: pcm))
-            try await write(WorkerProtocol.transcribeLine(
-                id: id,
-                sampleRate: Int(AppConfiguration.workerSampleRate),
-                language: AppConfiguration.language
-            ))
+            let send = try enqueueRequest(preview: id, pcm: pcm)
+            try await awaitPreviewSend(send)
         } catch {
-            // 書けなかった id は終端を待たない。表に残すと worker の作り直しまで
-            // 居座る。書き込みの失敗そのものは既存の `write` が扱う（設計書 8.2）。
+            // 送れなかった id は終端を待たない。表に残すと worker の作り直しまで
+            // 居座る。期限で捨てた分は1バイトも書いていないので、worker はこの id を
+            // 知らないままである（設計書 8.2、レビュー MUST 2）。
             pending.removeValue(forKey: id)
+            Log.worker.debug("preview send failed: \(SpeechWorkerClient.code(of: error), privacy: .public)")
             throw error
         }
         touch(id)
@@ -531,13 +534,45 @@ actor SpeechWorkerClient {
         }
     }
 
+    /// `chunk` と `transcribe` を1件の予約として積む。2行を1件にまとめるので、
+    /// あいだへ `cancel` の行が割り込めない（レビュー MUST 1）。
+    ///
+    /// `cancel(id:)` と `failAllPending` は表から id を外す。外れていれば、この
+    /// プレビューはもう要らないので1バイトも送らない。
+    private func enqueueRequest(preview id: String, pcm: Data) throws -> PipeWrite {
+        guard let writer else { throw WorkerFailure.notRunning }
+        guard pending[id] != nil else { throw WorkerFailure.cancelled }
+        var lines = WorkerProtocol.chunkLine(id: id, seq: 0, pcm: pcm)
+        lines.append(WorkerProtocol.transcribeLine(
+            id: id,
+            sampleRate: Int(AppConfiguration.workerSampleRate),
+            language: AppConfiguration.language
+        ))
+        return writer.enqueue(lines)
+    }
+
+    /// 送信の完了を待つ。期限までに書き始められなければ捨てる。詰まった送信を
+    /// 5 秒待ってから worker を止める `write` は通らないので、最大 2.56MB の
+    /// プレビューが録音ごと壊すことはない（レビュー MUST 2）。
+    private func awaitPreviewSend(_ send: PipeWrite) async throws {
+        let budget = Task {
+            try? await Task.sleep(for: .seconds(AppConfiguration.previewSendBudgetSeconds))
+            send.expire()
+        }
+        defer { budget.cancel() }
+        try await send.wait()
+    }
+
     /// プレビューが沈黙した。その id へ `cancel` を送って失敗にするが、worker は
-    /// 作り直さない（設計書 8.2）。
-    private func timeOutPreview(id: String) async {
+    /// 作り直さない（設計書 8.2、レビュー MUST 2）。
+    private func timeOutPreview(id: String) {
         Log.worker.debug("preview timed out")
-        // 先に待ち側を解放する。`write` が詰まっていても次のラウンドへ進める。
+        // 先に待ち側を解放する。送信が詰まっていても次のラウンドへ進める。
         deliver(id: id, .failure(WorkerFailure.timeout("preview")))
-        try? await write(WorkerProtocol.cancelLine(id: id))
+        // 走り出した要求は止めたい。取消の行は小さく、順序は積んだ順で決まるので
+        // 完了は待たず、期限でも捨てない。捨てると worker が走り続ける。
+        guard let writer else { return }
+        _ = writer.enqueue(WorkerProtocol.cancelLine(id: id))
     }
 
     /// Esc で取り消す。文書のとおり `transcribe` は送らない（設計書 12.5）。
