@@ -1,0 +1,6 @@
+.build/
+build/
+ref/
+.DS_Store
+*.app
+.sign.env
