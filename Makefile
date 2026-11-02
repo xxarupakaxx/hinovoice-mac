@@ -100,6 +100,10 @@ selftest: build
 	"$(BIN)" --selftest-keys
 	@echo "--- セッションの世代（Esc と認識完了の競合） ---"
 	"$(BIN)" --selftest-session
+	@echo "--- 貼り付け先の照合（入力先を確かめられないときは貼らない） ---"
+	"$(BIN)" --selftest-target
+	@echo "--- 終了処理の順番（開始と貼り付けの禁止、復元待ち） ---"
+	"$(BIN)" --selftest-shutdown
 	@echo "--- クリップボードの保存と復元 ---"
 	"$(BIN)" --selftest-clipboard
 	@echo "--- 16kHz モノラル 16bit への変換 ---"

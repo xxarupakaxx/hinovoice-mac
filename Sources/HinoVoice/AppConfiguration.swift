@@ -65,9 +65,11 @@ enum AppConfiguration {
     static let modifierReleaseWaitSeconds = 0.5
     static let modifierPollSeconds = 0.02
 
-    /// フォーカス要素の問い合わせに使う属性名。`kAXFocusedUIElementAttribute` は
+    /// フォーカスの問い合わせに使う属性名。`kAXFocusedUIElementAttribute` などは
     /// 可変のグローバルとして import されるため Swift 6 では参照できない。
     static let axFocusedUIElementAttribute = "AXFocusedUIElement"
+    /// フォーカス要素を読めないアプリで代わりに見るウィンドウ（レビュー MUST 5）。
+    static let axFocusedWindowAttribute = "AXFocusedWindow"
 
     /// アクセシビリティの問い合わせの待ち時間。応答しないアプリで貼り付けが
     /// 固まらないようにする。

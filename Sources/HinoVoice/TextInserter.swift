@@ -2,47 +2,112 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 
+/// アクセシビリティの要素を比較できる形に包む。AXUIElement は同じ対象を指して
+/// いれば `CFEqual` で等しくなるが、Swift の `==` は持っていない。包んでおくと、
+/// 照合の規則を AXUIElement を作れない環境でも検査できる純粋関数にできる。
+struct AXIdentity: Equatable {
+    let element: AXUIElement
+
+    static func == (lhs: AXIdentity, rhs: AXIdentity) -> Bool {
+        CFEqual(lhs.element, rhs.element)
+    }
+}
+
+/// 貼り付け先の照合規則。識別子は Equatable への一般化で受けるので、
+/// `--selftest-target` から同じ関数を検査できる（レビュー MUST 5）。
+enum PasteTargetPolicy {
+    /// 規則は3段で、上から順に当てはめる。
+    ///
+    /// 1. プロセスが違えば貼らない。
+    /// 2. 両方でフォーカス要素を読めたなら、同じ要素のときだけ貼る。
+    /// 3. どちらでも読めなかったなら（アクセシビリティにフォーカスを出さない
+    ///    アプリ。一部の Electron 製アプリなど）、両方で読めたフォーカス
+    ///    ウィンドウが同じときだけ貼る。ウィンドウも読めなければ貼らない。
+    ///
+    /// 片側だけ読めた場合は貼らない。読めたはずのものが読めなくなった状態で、
+    /// プロセスの一致だけを根拠にすると、同じアプリの別ウィンドウ・別入力欄へ
+    /// 文字を入れてしまう。入力先を確かめられないときは貼らないほうを選ぶ。
+    static func matches<Identity: Equatable>(
+        pid: pid_t,
+        element: Identity?,
+        window: Identity?,
+        otherPID: pid_t,
+        otherElement: Identity?,
+        otherWindow: Identity?
+    ) -> Bool {
+        guard pid == otherPID else { return false }
+        switch (element, otherElement) {
+        case let (mine?, theirs?):
+            return mine == theirs
+        case (nil, nil):
+            guard let mine = window, let theirs = otherWindow else { return false }
+            return mine == theirs
+        default:
+            return false
+        }
+    }
+}
+
 /// 録音開始時の貼り付け先。録音中にフォーカスが別のアプリへ移ったら貼らない
 /// （OpenHinoVoice src/paste.rs:156-173、src/main.rs:221-230 と同じ考え方）。
 /// プロセスだけでは同じアプリの別ウィンドウ・別入力欄を区別できないので、
-/// アクセシビリティから取れる場合はフォーカス要素も覚える。
+/// アクセシビリティから取れるフォーカスも覚える。
 struct PasteTarget {
     let processIdentifier: pid_t
-    /// 開始時にフォーカスのあった要素。取れない環境では nil になり、判定は
-    /// アプリ単位へ落ちる。
-    let focusedElement: AXUIElement?
+    /// フォーカスのあった要素。アクセシビリティに出さないアプリでは nil。
+    let focusedElement: AXIdentity?
+    /// 要素を読めなかったときの代わり。要素を読めた場合は引かない。
+    let focusedWindow: AXIdentity?
 
     static func current() -> PasteTarget? {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        let pid = app.processIdentifier
+        let element = focusedElement()
         return PasteTarget(
-            processIdentifier: app.processIdentifier,
-            focusedElement: focusedElement()
+            processIdentifier: pid,
+            focusedElement: element,
+            // 要素が取れているときはウィンドウを見ない。照合では使わないので、
+            // 相手のアプリへの問い合わせを1回減らす。
+            focusedWindow: element == nil ? focusedWindow(of: pid) : nil
         )
     }
 
     /// システム全体のフォーカス要素を取る。問い合わせは相手のアプリへの同期
     /// 通信なので、応答しないアプリで固まらないよう待ち時間を短く設定する。
-    private static func focusedElement() -> AXUIElement? {
+    private static func focusedElement() -> AXIdentity? {
         guard AXIsProcessTrusted() else { return nil }
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, Float(AppConfiguration.axMessagingTimeoutSeconds))
-        var value: CFTypeRef?
-        let status = AXUIElementCopyAttributeValue(
-            system,
-            AppConfiguration.axFocusedUIElementAttribute as CFString,
-            &value
-        )
-        guard status == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-        // 直前に型を確認している。
-        return (value as! AXUIElement)
+        return copyElement(from: system, attribute: AppConfiguration.axFocusedUIElementAttribute)
     }
 
-    /// 同じ貼り付け先かどうか。AXUIElement は同じ対象を指していれば CFEqual で
-    /// 等しくなる。どちらかが取れていない場合はアプリの一致だけで判定する。
+    /// フォーカス要素を読めないアプリ向けの代わり。アプリの要素から前面の
+    /// ウィンドウを引く。同じアプリの別ウィンドウへ移った場合はここで分かる。
+    private static func focusedWindow(of pid: pid_t) -> AXIdentity? {
+        guard AXIsProcessTrusted() else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, Float(AppConfiguration.axMessagingTimeoutSeconds))
+        return copyElement(from: app, attribute: AppConfiguration.axFocusedWindowAttribute)
+    }
+
+    private static func copyElement(from element: AXUIElement, attribute: String) -> AXIdentity? {
+        var value: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        guard status == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        // 直前に型を確認している。
+        return AXIdentity(element: value as! AXUIElement)
+    }
+
+    /// 同じ貼り付け先かどうか。規則は `PasteTargetPolicy.matches` にある。
     func matches(_ other: PasteTarget) -> Bool {
-        guard processIdentifier == other.processIdentifier else { return false }
-        guard let mine = focusedElement, let theirs = other.focusedElement else { return true }
-        return CFEqual(mine, theirs)
+        PasteTargetPolicy.matches(
+            pid: processIdentifier,
+            element: focusedElement,
+            window: focusedWindow,
+            otherPID: other.processIdentifier,
+            otherElement: other.focusedElement,
+            otherWindow: other.focusedWindow
+        )
     }
 }
 

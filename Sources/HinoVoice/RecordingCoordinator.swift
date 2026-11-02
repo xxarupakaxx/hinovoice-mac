@@ -36,6 +36,41 @@ struct SessionGeneration: Equatable {
     }
 }
 
+/// 終了処理と、開始・貼り付けの可否（レビュー MUST 7）。`shutdown()` は最初に
+/// 同期で `beginShutdown()` を呼び、新しい開始と新しい貼り付けを断ってから、
+/// 進行中の貼り付けがクリップボードを戻すのを待つ。順番を逆にすると、待つか
+/// どうかを決めたあとに始まった貼り付けを取りこぼし、元のクリップボードが
+/// 戻らない。純粋な状態なので `--selftest-shutdown` で検証する。
+struct ShutdownGate: Equatable {
+    /// 終了処理が始まっているか。一度立つと戻らない。
+    private(set) var isShuttingDown = false
+    /// 貼り付けを予約してから復元が終わるまで。
+    private(set) var isPasting = false
+
+    /// 新しい録音と worker の再起動を始めてよいか。
+    var allowsStart: Bool { !isShuttingDown }
+
+    /// 終了処理が貼り付けの復元を待つ必要があるか。
+    var waitsForPaste: Bool { isPasting }
+
+    /// 終了の開始。これ以降は開始も貼り付けも受け付けない。
+    mutating func beginShutdown() {
+        isShuttingDown = true
+    }
+
+    /// 貼り付けを予約する。終了処理が始まっていれば予約できない。
+    mutating func beginPaste() -> Bool {
+        guard !isShuttingDown else { return false }
+        isPasting = true
+        return true
+    }
+
+    /// クリップボードの復元まで終わった。
+    mutating func endPaste() {
+        isPasting = false
+    }
+}
+
 /// 状態遷移を行うのはこの型だけ（設計書 9）。
 @MainActor
 final class RecordingCoordinator {
@@ -91,8 +126,8 @@ final class RecordingCoordinator {
     /// 開始処理が走っている間。マイクの許可待ちと `newRequest` の待ちの間も
     /// 状態は idle のままなので、これがないと開始処理が二重に入る。
     private var isStarting = false
-    /// 貼り付けが進んでいる間。終了処理はクリップボードの復元を待つ。
-    private var isPasting = false
+    /// 終了処理の印と、貼り付けが進んでいるかどうか。
+    private var gate = ShutdownGate()
     private var pasteWaiters: [CheckedContinuation<Void, Never>] = []
 
     var onPresentation: ((MenuPresentation) -> Void)?
@@ -127,6 +162,7 @@ final class RecordingCoordinator {
     }
 
     func retryWorker() {
+        guard gate.allowsStart else { return }
         state = .idle
         notice = nil
         Task { await worker.retry() }
@@ -142,13 +178,18 @@ final class RecordingCoordinator {
     }
 
     func shutdown() async {
-        limitTask?.cancel()
-        limitTask = nil
-        _ = capture?.stop()
-        capture = nil
+        // 最初の `await` より前に、同期で終了を確定させる。印を立てて新しい開始と
+        // 貼り付けを断り、世代を無効化して録音・文字起こしを畳む。こうしないと、
+        // 文字起こし中に終了した場合に、`await worker.shutdown()` の中断中に届いた
+        // 結果から貼り付けが始まり、クリップボードが戻らない（レビュー MUST 7）。
+        gate.beginShutdown()
+        _ = invalidateSession()
+        // 状態が idle のままなら `transition` は何もしないので、ここで明示的に
+        // タップへ伝える。終了中のキーは飲み込まずアプリへ渡す。
+        syncTap()
         // 400ms の復元待ちの途中で終わらせると、元のクリップボードを戻せない。
-        // 貼り付けが終わってから worker を止める。
-        if isPasting {
+        // すでに始まっている貼り付けが終わってから worker を止める。
+        if gate.waitsForPaste {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 pasteWaiters.append(continuation)
             }
@@ -176,7 +217,7 @@ final class RecordingCoordinator {
     // MARK: 遷移
 
     private func beginRecording() async {
-        guard !isStarting, state.acceptsStartKey else { return }
+        guard gate.allowsStart, !isStarting, state.acceptsStartKey else { return }
         if case let .unavailable(reason) = state {
             show(notice: reason)
             return
@@ -275,7 +316,10 @@ final class RecordingCoordinator {
             sender = nil
             // 貼り付けの予約は await を挟む前に済ませる。`paste` の中で印を
             // 付けると、その呼び出しの中断中に終了処理が通り抜けられる。
-            beginPaste()
+            guard beginPaste() else {
+                Log.state.notice("paste refused; shutting down")
+                return
+            }
             // 段階2の AI 整形はこの1行の前に入る（設計書 15）。
             await paste(transcript.text, session: session)
         } catch {
@@ -294,16 +338,18 @@ final class RecordingCoordinator {
     }
 
     /// 貼り付けを予約する。終了処理はここからクリップボードの復元までを待つ。
-    private func beginPaste() {
-        isPasting = true
+    /// 終了が始まっていれば予約できない（レビュー MUST 7）。
+    private func beginPaste() -> Bool {
+        guard gate.beginPaste() else { return false }
         transition(to: .pasting)
+        return true
     }
 
     private func paste(_ text: String, session: Int) async {
         let target = self.target
         self.target = nil
         let outcome = await TextInserter.insert(text, into: target)
-        isPasting = false
+        gate.endPaste()
         releasePasteWaiters()
         // 貼り付け中は開始も取り消しも受けないので、ここで世代が変わるのは
         // 想定外である。変わっていれば状態はすでに待機中に戻っている。
@@ -378,11 +424,12 @@ final class RecordingCoordinator {
         publish()
     }
 
-    /// コールバックが同期的に読む値を更新する（設計書 10.2）。
+    /// コールバックが同期的に読む値を更新する（設計書 10.2）。終了が始まったあとは
+    /// 何も飲み込まず、開始キーも受けない（レビュー MUST 7）。
     private func syncTap() {
         monitor?.update(
-            swallowsConfirmKeys: state.swallowsConfirmKeys,
-            acceptsStartKey: state.acceptsStartKey
+            swallowsConfirmKeys: gate.allowsStart && state.swallowsConfirmKeys,
+            acceptsStartKey: gate.allowsStart && state.acceptsStartKey
         )
     }
 

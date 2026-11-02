@@ -13,6 +13,10 @@ enum SelfTest {
             return keys()
         case "--selftest-session":
             return session()
+        case "--selftest-target":
+            return pasteTarget()
+        case "--selftest-shutdown":
+            return shutdownGate()
         case "--selftest-clipboard":
             return clipboard()
         case "--selftest-audio":
@@ -22,7 +26,8 @@ enum SelfTest {
         case "--selftest-worker":
             return blocking { await worker(arguments) }
         default:
-            print("使い方: HinoVoice --selftest-keys | --selftest-session | --selftest-clipboard"
+            print("使い方: HinoVoice --selftest-keys | --selftest-session | --selftest-target"
+                + " | --selftest-shutdown | --selftest-clipboard"
                 + " | --selftest-audio <in.wav> <out.wav> | --selftest-downmix"
                 + " | --selftest-worker <in.wav>")
             return 2
@@ -230,6 +235,120 @@ enum SelfTest {
         check(third != first && third != second, "世代は常に新しい値になる")
 
         print(failures == 0 ? "セッションの世代: 全件 ok" : "セッションの世代: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: 貼り付け先の照合
+
+    /// 入力先を確かめられないときは貼らない（レビュー MUST 5）。AXUIElement は
+    /// 他のアプリの状態なので作れないが、規則は識別子の等価判定だけで決まる。
+    /// ここでは `Int` を識別子の代わりに渡して、同じ関数を検査する。
+    private static func pasteTarget() -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+        /// 録音開始時（element / window）と貼り付け時（other...）の組を渡す。
+        func matches(
+            pid: pid_t = 100,
+            element: Int? = nil,
+            window: Int? = nil,
+            otherPID: pid_t = 100,
+            otherElement: Int? = nil,
+            otherWindow: Int? = nil
+        ) -> Bool {
+            PasteTargetPolicy.matches(
+                pid: pid,
+                element: element,
+                window: window,
+                otherPID: otherPID,
+                otherElement: otherElement,
+                otherWindow: otherWindow
+            )
+        }
+
+        check(
+            !matches(element: 1, otherPID: 200, otherElement: 1),
+            "別のアプリへ移ったら貼らない"
+        )
+        check(matches(element: 1, otherElement: 1), "同じフォーカス要素なら貼る")
+        check(
+            !matches(element: 1, otherElement: 2),
+            "同じアプリでも別の入力欄へ移ったら貼らない"
+        )
+        // 片側だけ読めた場合。プロセスの一致だけを根拠にすると、同じアプリの
+        // 別ウィンドウ・別入力欄へ文字を入れてしまう。
+        check(
+            !matches(element: 1, otherElement: nil, otherWindow: 9),
+            "開始時に読めた要素が貼り付け時に読めなければ貼らない"
+        )
+        check(
+            !matches(element: nil, window: 9, otherElement: 2),
+            "開始時に読めなかった要素が貼り付け時に読めても貼らない"
+        )
+        // フォーカス要素をまったく出さないアプリ。ウィンドウで照合する。
+        check(
+            matches(element: nil, window: 9, otherElement: nil, otherWindow: 9),
+            "要素を読めないアプリは同じウィンドウなら貼る"
+        )
+        check(
+            !matches(element: nil, window: 9, otherElement: nil, otherWindow: 8),
+            "要素を読めないアプリで別のウィンドウへ移ったら貼らない"
+        )
+        check(
+            !matches(element: nil, window: nil, otherElement: nil, otherWindow: nil),
+            "要素もウィンドウも読めなければ貼らない"
+        )
+        check(
+            !matches(element: nil, window: 9, otherElement: nil, otherWindow: nil),
+            "ウィンドウが片側しか読めなければ貼らない"
+        )
+        check(
+            !matches(element: nil, window: 9, otherPID: 200, otherElement: nil, otherWindow: 9),
+            "ウィンドウが同じに見えてもプロセスが違えば貼らない"
+        )
+
+        print(failures == 0 ? "貼り付け先の照合: 全件 ok" : "貼り付け先の照合: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: 終了処理の順番
+
+    /// 終了は同期で確定させてから待つ（レビュー MUST 7）。印を立てる前に待つか
+    /// どうかを決めると、そのあとに始まった貼り付けを取りこぼす。
+    private static func shutdownGate() -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+
+        var gate = ShutdownGate()
+        check(gate.allowsStart, "終了前は録音を始められる")
+        check(!gate.waitsForPaste, "貼り付けていなければ worker をすぐ止められる")
+        check(gate.beginPaste(), "終了前は貼り付けを予約できる")
+        check(gate.waitsForPaste, "予約したら終了処理は復元を待つ")
+
+        gate.beginShutdown()
+        check(!gate.allowsStart, "終了が始まったら録音を始められない")
+        check(gate.waitsForPaste, "終了の開始時に進んでいる貼り付けは待つ")
+        check(!gate.beginPaste(), "終了が始まったら新しい貼り付けを予約できない")
+        check(gate.waitsForPaste, "断った予約で待ちの対象は増えない")
+        gate.endPaste()
+        check(!gate.waitsForPaste, "復元が終われば待たない")
+        check(!gate.allowsStart, "終了の印は戻らない")
+        check(!gate.beginPaste(), "復元のあとも新しい貼り付けは始まらない")
+
+        // 文字起こし中に終了した場合。worker を止める前に印を立てるので、
+        // あとから届いた結果で貼り付けが始まることはない。
+        var transcribing = ShutdownGate()
+        transcribing.beginShutdown()
+        check(!transcribing.waitsForPaste, "予約がなければ待たずに worker を止める")
+        check(!transcribing.beginPaste(), "終了後に届いた結果は貼り付けへ進めない")
+        check(!transcribing.waitsForPaste, "断ったので復元待ちも発生しない")
+
+        print(failures == 0 ? "終了処理の順番: 全件 ok" : "終了処理の順番: \(failures) 件 FAIL")
         return failures == 0 ? 0 : 1
     }
 
