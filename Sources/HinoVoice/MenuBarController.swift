@@ -43,6 +43,12 @@ final class MenuBarController: NSObject {
         statusItem.menu = menu
     }
 
+    /// プレビューの3段目に使う位置。キャレットもフォーカスウィンドウも取れない
+    /// ときは、この項目の下に出す（設計書 6.2）。
+    var statusItemFrame: CGRect? {
+        statusItem.button?.window?.frame
+    }
+
     func apply(_ presentation: MenuPresentation) {
         if let button = statusItem.button {
             // 記号が無い環境でメニューバーの項目が見えなくならないようにする。
