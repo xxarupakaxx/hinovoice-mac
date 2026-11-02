@@ -8,14 +8,6 @@
 [Haas-ja-v1.0](https://huggingface.co/third-intelligence/Haas-ja-v1.0) を常駐させて行う。
 音声はこの Mac の中だけで処理し、外部には送らない。
 
-## 元になったアプリ
-
-Windows 専用の [OpenHinoVoice](https://github.com/iiinno/OpenHinoVoice)（作者: iiinno、MIT）を
-参考にした **Mac 版** である。**同じ作者のものではなく、公式の移植でもない。** 状態の分け方と
-クリップボードを戻すタイミングの判断を参考にしているが、キーイベントの横取りと貼り付けは
-macOS の API（CGEventTap、CGEventPost、NSPasteboard）で書き直してある。
-出所の詳細は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にある。
-
 ## 使い方
 
 1. メニューバーのアイコンが「待機中」になっていることを確かめる。
@@ -138,5 +130,5 @@ worker の stderr の中身もログへ渡さない（記録するのは長さ�
 
 ## ライセンス
 
-MIT。[LICENSE](LICENSE) を参照。第三者のソフトウェアとモデルについては
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) を参照。
+MIT。[LICENSE](LICENSE) を参照。
+サードパーティのライセンスは [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) を参照。
