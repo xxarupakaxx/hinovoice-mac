@@ -18,6 +18,9 @@ enum AudioFailure: Error, Sendable {
 /// マイクの形式（内蔵なら 48kHz Float32）から worker へ送る形式へ変換する。
 /// ミックスダウンとリサンプルは AVAudioConverter に任せる（設計書 11）。
 final class AudioResampler {
+    /// モノラルの出力。`channels: 1` を指定した `AVAudioFormat` は
+    /// kAudioChannelLayoutTag_Mono のレイアウトを持つので、変換器は
+    /// ミックスダウン先のチャンネル配置を判断できる。
     static let outputFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: AppConfiguration.workerSampleRate,
@@ -34,6 +37,9 @@ final class AudioResampler {
         else {
             throw AudioFailure.unsupportedFormat
         }
+        // 既定の `downmix` は NO で、チャンネルを混ぜずに配置し直す。2ch の機器で
+        // 片側だけに音声が入る場合、その音声を落とすことになるので混ぜる側にする。
+        converter.downmix = true
         self.converter = converter
         self.inputFormat = inputFormat
     }
