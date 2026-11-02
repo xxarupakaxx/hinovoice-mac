@@ -111,6 +111,16 @@ selftest: build
 	afinfo "$(BUILD_DIR)/selftest-16k.wav" | grep -E 'Data format|Channels|Sample Rate|estimated duration' || true
 	@echo "--- ステレオのミックスダウン ---"
 	"$(BIN)" --selftest-downmix
+	@echo "--- プレビューの stable prefix（純粋関数） ---"
+	"$(BIN)" --selftest-prefix
+	@echo "--- プレビューの間隔とバックプレッシャー ---"
+	"$(BIN)" --selftest-preview-schedule
+	@echo "--- プレビューの表示状態（隠したあとに開き直さない） ---"
+	"$(BIN)" --selftest-preview-window
+	@echo "--- プレビューの位置（AX 座標の変換と画面への寄せ） ---"
+	"$(BIN)" --selftest-preview-place
+	@echo "--- 偽 worker との往復（プレビューが最終を壊さない） ---"
+	"$(BIN)" --selftest-preview-worker
 	@echo "--- speech worker との往復 ---"
 	"$(BIN)" --selftest-worker "$(TEST_WAV)"
 

@@ -25,11 +25,24 @@ enum SelfTest {
             return downmix()
         case "--selftest-worker":
             return blocking { await worker(arguments) }
+        case "--selftest-prefix":
+            return prefix()
+        case "--selftest-preview-schedule":
+            return previewSchedule()
+        case "--selftest-preview-window":
+            return previewWindow()
+        case "--selftest-preview-place":
+            return previewPlace()
+        case "--selftest-preview-worker":
+            return blocking { await previewWorker() }
         default:
             print("使い方: HinoVoice --selftest-keys | --selftest-session | --selftest-target"
                 + " | --selftest-shutdown | --selftest-clipboard"
                 + " | --selftest-audio <in.wav> <out.wav> | --selftest-downmix"
-                + " | --selftest-worker <in.wav>")
+                + " | --selftest-worker <in.wav>"
+                + " | --selftest-prefix | --selftest-preview-schedule"
+                + " | --selftest-preview-window | --selftest-preview-place"
+                + " | --selftest-preview-worker")
             return 2
         }
     }
@@ -549,6 +562,518 @@ enum SelfTest {
             print("worker との往復: FAIL \(SpeechWorkerClient.message(of: error))")
             return 1
         }
+    }
+
+    // MARK: stable prefix
+
+    /// 届かない回は据え置き、伸びた回だけ作り直す。長さは後退しない
+    /// （設計書 3.1、3.2 の A'）。
+    private static func prefix() -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+
+        var text = PreviewText()
+        // 最初のラウンドは比較相手がないので何も出さない。方式Aは連続2回で
+        // 一致した先頭部分だけを出す。
+        var update = text.accept(preview: "きょ")
+        check(update.displayed.isEmpty, "最初の結果だけでは何も出さない")
+        check(update.commonPrefixCount == 0, "比較相手がない回の共通接頭辞は 0")
+
+        update = text.accept(preview: "きょうは")
+        check(update.displayed == "きょ", "2回で一致した先頭部分を出す")
+        check(update.changed, "伸びた回は変わったと分かる")
+
+        update = text.accept(preview: "きょうは良")
+        check(update.displayed == "きょうは", "一致が伸びれば表示も伸びる")
+
+        // 矛盾する結果。共通接頭辞が表示済みの長さに届かない。
+        update = text.accept(preview: "きのうは良")
+        check(update.displayed == "きょうは", "届かない回は据え置く")
+        check(!update.changed, "据え置いた回は変わらない")
+        check(update.commonPrefixCount == 1, "共通接頭辞そのものは短くなる")
+
+        update = text.accept(preview: "きょうは良い")
+        check(update.displayed == "きょうは", "前回が外れた直後も据え置く")
+
+        update = text.accept(preview: "きょうは良い天気")
+        check(update.displayed == "きょうは良い", "一致が追いついたら作り直す")
+
+        // 長さが後退しないこと。上の列をもう一度流して長さだけを見る。
+        var monotonic = PreviewText()
+        var lengths: [Int] = []
+        for result in ["きょ", "きょうは", "きょうは良", "きのうは良", "きょうは良い", "きょうは良い天気"] {
+            lengths.append(monotonic.accept(preview: result).displayed.count)
+        }
+        check(zip(lengths, lengths.dropFirst()).allSatisfy { $0 <= $1 }, "長さは後退しない \(lengths)")
+
+        // 最終結果で置き換わる（設計書 3.1）。
+        update = text.replace(final: "きょうは良い天気です。")
+        check(update.displayed == "きょうは良い天気です。", "最終結果で置き換わる")
+
+        // `Character` 単位で切る。UTF-16 単位だと濁点や絵文字の途中で切れる。
+        check(
+            PreviewText.commonPrefixCount("が", "か\u{3099}") == 1,
+            "合成済みの濁点と結合文字の濁点は1文字として一致する"
+        )
+        check(
+            PreviewText.commonPrefixCount("👨‍👩‍👧あ", "👨‍👩‍👧い") == 1,
+            "連結された絵文字は1文字として数える"
+        )
+        var emoji = PreviewText()
+        _ = emoji.accept(preview: "👨‍👩‍👧あ")
+        let shown = emoji.accept(preview: "👨‍👩‍👧い").displayed
+        check(shown == "👨‍👩‍👧", "絵文字の途中で切らない")
+
+        // 空文字列と1文字の境界。
+        var empty = PreviewText()
+        check(empty.accept(preview: "").displayed.isEmpty, "空の結果で何も出さない")
+        check(empty.accept(preview: "").displayed.isEmpty, "空が続いても何も出さない")
+        var single = PreviewText()
+        _ = single.accept(preview: "あ")
+        check(single.accept(preview: "あ").displayed == "あ", "1文字でも2回一致すれば出す")
+        check(PreviewText.commonPrefixCount("", "あ") == 0, "空文字列との共通接頭辞は 0")
+
+        // 表示の上限（設計書 3.3）。末尾を残して先頭を落とす。
+        let long = String(repeating: "あ", count: 130)
+        let clamped = PreviewText.clamped(long, limit: 120)
+        check(clamped.count == 121, "上限を超えたら 120 文字と先頭の … にする")
+        check(clamped.hasPrefix("…"), "落とした印を先頭に付ける")
+        check(clamped.hasSuffix("あ"), "新しい側を残す")
+        check(PreviewText.clamped("あい", limit: 120) == "あい", "上限内はそのまま")
+        check(PreviewText.clamped("", limit: 120).isEmpty, "空文字列はそのまま")
+        check(PreviewText.clamped("あ", limit: 0).isEmpty, "上限 0 では何も出さない")
+
+        print(failures == 0 ? "stable prefix: 全件 ok" : "stable prefix: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: 間隔とバックプレッシャー
+
+    private static func previewSchedule() -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+        func interval(_ seconds: Double) -> Double {
+            PreviewSchedule.interval(accumulatedSeconds: seconds)
+        }
+
+        // 間隔は clamp(蓄積秒数 / 20, 1, 3)（設計書 4.1）。
+        check(interval(0) == 1.0, "始めは 1 秒")
+        check(interval(10) == 1.0, "10 秒までは下限の 1 秒")
+        check(interval(20) == 1.0, "20 秒でちょうど 1 秒")
+        check(interval(30) == 1.5, "30 秒で 1.5 秒")
+        check(interval(40) == 2.0, "40 秒で 2 秒")
+        check(interval(60) == 3.0, "60 秒で上限の 3 秒")
+        check(interval(600) == 3.0, "上限を超えない")
+
+        // 前のラウンドの終端前に次を出さない（バックプレッシャー）。
+        var schedule = PreviewSchedule()
+        check(schedule.beginRound(isRecording: true), "録音中はラウンドを始められる")
+        check(!schedule.beginRound(isRecording: true), "走っている間は次を出さない")
+        check(schedule.roundCount == 1, "断ったラウンドは数えない")
+        schedule.finishRound(success: true)
+        check(schedule.beginRound(isRecording: true), "終端が来たら次を出せる")
+        schedule.finishRound(success: true)
+        check(schedule.roundCount == 2, "成立したラウンドだけを数える")
+
+        // 録音中以外ではラウンドを作らない。
+        check(!schedule.beginRound(isRecording: false), "録音中でなければラウンドを作らない")
+
+        // 3 回連続で失敗したら止まり、成功で失敗数は戻る（設計書 8.2）。
+        var failing = PreviewSchedule()
+        _ = failing.beginRound(isRecording: true)
+        failing.finishRound(success: false)
+        check(failing.consecutiveFailures == 1 && !failing.isStopped, "1 回の失敗では止まらない")
+        _ = failing.beginRound(isRecording: true)
+        failing.finishRound(success: true)
+        check(failing.consecutiveFailures == 0, "成功で連続失敗は 0 へ戻る")
+        check(failing.failureCount == 1, "合計の失敗数は残る")
+        for _ in 0 ..< 2 {
+            _ = failing.beginRound(isRecording: true)
+            failing.finishRound(success: false)
+        }
+        check(!failing.isStopped, "連続 2 回では止まらない")
+        _ = failing.beginRound(isRecording: true)
+        failing.finishRound(success: false)
+        check(failing.isStopped, "連続 3 回で止まる")
+        check(!failing.beginRound(isRecording: true), "止まったあとはラウンドを作らない")
+        check(failing.failureCount == 4, "合計の失敗数を数えている")
+
+        // Enter と Esc は予約を止める。
+        var stopping = PreviewSchedule()
+        stopping.stop()
+        check(!stopping.beginRound(isRecording: true), "止めたあとはラウンドを作らない")
+
+        // 録音ごとのログに出す最小と最大（設計書 8.1）。
+        var intervals = PreviewSchedule()
+        intervals.noteInterval(1.0)
+        intervals.noteInterval(3.0)
+        intervals.noteInterval(2.0)
+        check(intervals.minimumInterval == 1.0 && intervals.maximumInterval == 3.0, "間隔の最小と最大を覚える")
+
+        print(failures == 0 ? "プレビューの間隔: 全件 ok" : "プレビューの間隔: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: 表示状態の遷移
+
+    private static func previewWindow() -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+
+        var window = PreviewWindowState()
+        check(!window.isVisible, "始めは出していない")
+        check(!window.show("", isRecording: true), "空文字列では出さない")
+        check(window.show("きょ", isRecording: true), "最初の stable prefix で出す")
+        check(window.isVisible && window.text == "きょ", "出した内容を持つ")
+        check(window.show("きょうは", isRecording: true), "伸びた内容で描き直す")
+
+        // Enter と Esc。隠したあとは、遅れて届いた結果で開き直さない。
+        check(window.hide(), "出していたら隠す")
+        check(!window.isVisible, "隠れている")
+        check(!window.show("きょうは良い", isRecording: true), "隠したあとの結果では開き直さない")
+        check(!window.isVisible, "開き直していない")
+        check(!window.hide(), "二度目の hide では何もしない")
+
+        // 新しい録音で印が戻る。
+        window.reset()
+        check(!window.isSealed && !window.isVisible && window.text.isEmpty, "新しい録音で状態が戻る")
+        check(window.show("あ", isRecording: true), "次の録音では出せる")
+
+        // 録音中以外では表示状態にならない（`.transcribing` / `.pasting` /
+        // `.retrying` / `unavailable` / 終了）。
+        var other = PreviewWindowState()
+        check(!other.show("きょ", isRecording: false), "録音中でなければ出さない")
+        check(!other.isVisible, "録音中でなければ表示状態にならない")
+
+        // `.retrying` や `unavailable` で畳む場合。出していなくても印は立つ。
+        var folded = PreviewWindowState()
+        check(!folded.hide(), "出していなければ画面を触らない")
+        check(folded.isSealed, "それでも以降は出さない印が立つ")
+        check(!folded.show("きょ", isRecording: true), "畳んだあとは出さない")
+
+        print(failures == 0 ? "プレビューの表示状態: 全件 ok" : "プレビューの表示状態: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: 座標変換と画面への寄せ
+
+    private static func previewPlace() -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+
+        // 1 画面。メニューバー 38pt と Dock 25pt を想定する。
+        let primary = ScreenBox(
+            frame: CGRect(x: 0, y: 0, width: 1800, height: 1200),
+            visibleFrame: CGRect(x: 0, y: 25, width: 1800, height: 1137)
+        )
+        let size = CGSize(width: 420, height: 40)
+        let gap = 6.0
+
+        // 使えない矩形は次の段へ落ちる（設計書 6.2）。
+        check(!PreviewPlacement.isUsable(axRect: .zero), "幅も高さも 0 の矩形は使わない")
+        check(
+            !PreviewPlacement.isUsable(axRect: CGRect(x: 0, y: 0, width: 2, height: 18)),
+            "原点が (0,0) の矩形は使わない"
+        )
+        check(
+            PreviewPlacement.isUsable(axRect: CGRect(x: 100, y: 300, width: 0, height: 18)),
+            "幅 0 でも高さを持つキャレットの矩形は使う"
+        )
+        check(
+            !PreviewPlacement.isUsable(axRect: CGRect(x: 100, y: 300, width: 0, height: 0)),
+            "位置だけで大きさのない矩形は使わない"
+        )
+
+        // AX 左上原点 → AppKit 左下原点（設計書 6.3）。
+        let caretAX = CGRect(x: 100, y: 300, width: 2, height: 18)
+        let caret = PreviewPlacement.appKitRect(axRect: caretAX, primaryFrame: primary.frame)
+        check(caret == CGRect(x: 100, y: 882, width: 2, height: 18), "AX の Y 下向きを AppKit の Y 上向きへ直す \(caret)")
+
+        // キャレットの 6pt 下。
+        let below = PreviewPlacement.frame(
+            anchor: PreviewAnchor(rect: caret, tier: .caret, prefersBelow: true),
+            size: size,
+            screen: primary,
+            gap: gap
+        )
+        check(below == CGRect(x: 100, y: 836, width: 420, height: 40), "キャレットの 6pt 下に置く \(below)")
+
+        // 下に入らなければ上へ出す。
+        let lowAX = CGRect(x: 100, y: 1150, width: 2, height: 18)
+        let low = PreviewPlacement.appKitRect(axRect: lowAX, primaryFrame: primary.frame)
+        let flipped = PreviewPlacement.frame(
+            anchor: PreviewAnchor(rect: low, tier: .caret, prefersBelow: true),
+            size: size,
+            screen: primary,
+            gap: gap
+        )
+        check(flipped.minY == low.maxY + gap, "下に入らなければキャレットの上へ出す \(flipped)")
+        check(flipped.minY >= primary.visibleFrame.minY, "見える範囲の中に収まる")
+
+        // 右端と左端への寄せ。
+        let right = PreviewPlacement.frame(
+            anchor: PreviewAnchor(rect: CGRect(x: 1700, y: 600, width: 2, height: 18), tier: .caret, prefersBelow: true),
+            size: size,
+            screen: primary,
+            gap: gap
+        )
+        check(right.maxX == primary.visibleFrame.maxX, "右端からはみ出す分を寄せる \(right)")
+        let left = PreviewPlacement.frame(
+            anchor: PreviewAnchor(rect: CGRect(x: -200, y: 600, width: 2, height: 18), tier: .caret, prefersBelow: true),
+            size: size,
+            screen: primary,
+            gap: gap
+        )
+        check(left.minX == primary.visibleFrame.minX, "左端からはみ出す分を寄せる \(left)")
+
+        // フォーカスウィンドウは左下の内側なので上へ出す（設計書 6.2 の2段目）。
+        let windowAnchor = PreviewAnchor(
+            rect: CGRect(x: 300, y: 400, width: 0, height: 0),
+            tier: .window,
+            prefersBelow: false
+        )
+        let above = PreviewPlacement.frame(anchor: windowAnchor, size: size, screen: primary, gap: gap)
+        check(above == CGRect(x: 300, y: 406, width: 420, height: 40), "ウィンドウの基準の上へ出す \(above)")
+
+        // 幅は画面に収まる範囲まで（設計書 3.3）。
+        check(
+            PreviewPlacement.width(maximum: 420, visibleFrame: primary.visibleFrame, inset: 32) == 420,
+            "広い画面では上限の 420pt"
+        )
+        check(
+            PreviewPlacement.width(
+                maximum: 420,
+                visibleFrame: CGRect(x: 0, y: 0, width: 300, height: 400),
+                inset: 32
+            ) == 268,
+            "狭い画面では余白を残して縮める"
+        )
+
+        // 2 画面（左右配置、縦ずれ、解像度違い）。
+        let secondary = ScreenBox(
+            frame: CGRect(x: 1800, y: -200, width: 1920, height: 1080),
+            visibleFrame: CGRect(x: 1800, y: -200, width: 1920, height: 1055)
+        )
+        let screens = [primary, secondary]
+        check(
+            PreviewPlacement.screen(containing: caret, in: screens) == primary,
+            "主画面の矩形は主画面を選ぶ"
+        )
+        let onSecondaryAX = CGRect(x: 2000, y: 400, width: 2, height: 18)
+        let onSecondary = PreviewPlacement.appKitRect(axRect: onSecondaryAX, primaryFrame: primary.frame)
+        check(
+            PreviewPlacement.screen(containing: onSecondary, in: screens) == secondary,
+            "縦にずれた副画面の矩形は副画面を選ぶ \(onSecondary)"
+        )
+        let secondaryFrame = PreviewPlacement.frame(
+            anchor: PreviewAnchor(rect: onSecondary, tier: .caret, prefersBelow: true),
+            size: size,
+            screen: secondary,
+            gap: gap
+        )
+        check(
+            secondary.visibleFrame.contains(secondaryFrame),
+            "副画面の見える範囲へ収める \(secondaryFrame)"
+        )
+        let farRight = PreviewPlacement.frame(
+            anchor: PreviewAnchor(rect: CGRect(x: 3600, y: 500, width: 2, height: 18), tier: .caret, prefersBelow: true),
+            size: size,
+            screen: secondary,
+            gap: gap
+        )
+        check(farRight.maxX == secondary.visibleFrame.maxX, "副画面でも右端へ寄せる \(farRight)")
+        check(
+            PreviewPlacement.screen(containing: CGRect(x: 9000, y: 9000, width: 2, height: 18), in: screens) == nil,
+            "どの画面にも入らない矩形は選べない"
+        )
+        check(
+            PreviewPlacement.screen(containing: .zero, in: [primary]) == primary,
+            "原点はメニューバーのある画面に入る"
+        )
+
+        print(failures == 0 ? "プレビューの位置: 全件 ok" : "プレビューの位置: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: 偽 worker との往復
+
+    /// プレビューが最終を壊さないことを、実 worker もモデルも使わずに確かめる
+    /// （設計書 9.2）。自分自身を `--fake-worker` で起動する。
+    private static func previewWorker() async -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+
+        guard let executable = selfExecutablePath() else {
+            print("  FAIL 自分の実行ファイルの場所が分からない")
+            return 1
+        }
+        print("  fake worker: \(executable)")
+        // 1 秒ぶんの無音。偽 worker は中身を見ない。
+        let pcm = Data(count: Int(AppConfiguration.workerSampleRate) * 2)
+
+        func client(_ scenario: FakeWorker.Scenario) -> SpeechWorkerClient {
+            SpeechWorkerClient(
+                launch: WorkerLaunch(
+                    executable: executable,
+                    arguments: ["--fake-worker", scenario.rawValue]
+                )
+            ) { _ in }
+        }
+
+        // (a) プレビュー中に別 id の最終を投げる。偽 worker は、プレビューを
+        // 畳む前に最終の `transcribe` が来たら最終を error で返す。設計書 5.3 の
+        // 順序が崩れていればここで落ちる。
+        print("--- serial ---")
+        do {
+            let worker = client(.serial)
+            try await worker.startOnce()
+            let finalID = await worker.newRequest()
+            try await worker.send(chunk: pcm, id: finalID, seq: 0)
+            let previewID = await worker.newPreviewRequest()
+            let running = Task { try await worker.preview(id: previewID, pcm: pcm) }
+            try await Task.sleep(for: .milliseconds(150))
+
+            await worker.cancel(id: previewID)
+            let transcript = try await worker.transcribe(id: finalID)
+            check(!transcript.text.isEmpty, "cancel が最終より先に書かれ、最終が end を返す")
+
+            var code = ""
+            do {
+                _ = try await running.value
+            } catch {
+                code = SpeechWorkerClient.code(of: error)
+            }
+            check(code == "cancelled", "走っていたプレビューは cancelled で終わる（\(code)）")
+            let launches = await worker.launchCount
+            check(launches == 1, "worker を作り直していない（\(launches) 回起動）")
+            await worker.shutdown()
+        } catch {
+            print("  FAIL serial: \(SpeechWorkerClient.message(of: error))")
+            failures += 1
+        }
+
+        // (b) 3 秒かかるプレビューを走らせたまま Enter。cancel を出さなければ
+        // 最終はプレビューの終わりを待つ（設計書 5.1）。
+        print("--- slow-preview ---")
+        do {
+            let worker = client(.slowPreview)
+            try await worker.startOnce()
+            let finalID = await worker.newRequest()
+            try await worker.send(chunk: pcm, id: finalID, seq: 0)
+            let previewID = await worker.newPreviewRequest()
+            let running = Task { try await worker.preview(id: previewID, pcm: pcm) }
+            try await Task.sleep(for: .milliseconds(200))
+
+            let started = Date()
+            await worker.cancel(id: previewID)
+            let transcript = try await worker.transcribe(id: finalID)
+            let elapsed = Date().timeIntervalSince(started)
+            _ = try? await running.value
+            check(
+                !transcript.text.isEmpty && elapsed < 1.0,
+                "Enter 後の最終が 1 秒以内に終わる（\(Int(elapsed * 1000)) ms）"
+            )
+            let launches = await worker.launchCount
+            check(launches == 1, "worker を作り直していない（\(launches) 回起動）")
+            await worker.shutdown()
+        } catch {
+            print("  FAIL slow-preview: \(SpeechWorkerClient.message(of: error))")
+            failures += 1
+        }
+
+        // (c) プレビューが error。失敗はプレビューだけに閉じる（設計書 8.2）。
+        print("--- preview-error ---")
+        do {
+            let worker = client(.previewError)
+            try await worker.startOnce()
+            let finalID = await worker.newRequest()
+            try await worker.send(chunk: pcm, id: finalID, seq: 0)
+            let previewID = await worker.newPreviewRequest()
+
+            var code = ""
+            do {
+                _ = try await worker.preview(id: previewID, pcm: pcm)
+            } catch {
+                code = SpeechWorkerClient.code(of: error)
+            }
+            check(code == "worker_audio", "プレビューの error をそのまま受ける（\(code)）")
+            let transcript = try await worker.transcribe(id: finalID)
+            check(!transcript.text.isEmpty, "最終は成功する")
+            let launches = await worker.launchCount
+            check(launches == 1, "プレビューの error で worker を作り直さない（\(launches) 回起動）")
+            await worker.shutdown()
+        } catch {
+            print("  FAIL preview-error: \(SpeechWorkerClient.message(of: error))")
+            failures += 1
+        }
+
+        // (d) プレビューが沈黙。既存の `timeOut(id:)` は worker を terminate するので、
+        // プレビューはその関数を通さない（設計書 8.2）。
+        print("--- preview-silent ---")
+        do {
+            let worker = client(.previewSilent)
+            try await worker.startOnce()
+            let finalID = await worker.newRequest()
+            try await worker.send(chunk: pcm, id: finalID, seq: 0)
+            let previewID = await worker.newPreviewRequest()
+
+            let started = Date()
+            var code = ""
+            do {
+                _ = try await worker.preview(id: previewID, pcm: pcm)
+            } catch {
+                code = SpeechWorkerClient.code(of: error)
+            }
+            let elapsed = Date().timeIntervalSince(started)
+            check(code == "timeout_preview", "沈黙したプレビューを時間で切る（\(code)）")
+            check(
+                elapsed >= AppConfiguration.previewIdleTimeoutSeconds,
+                "\(AppConfiguration.previewIdleTimeoutSeconds) 秒より前には切らない（\(String(format: "%.2f", elapsed)) 秒）"
+            )
+            check(
+                elapsed < AppConfiguration.previewIdleTimeoutSeconds + 2,
+                "待ちすぎない（\(String(format: "%.2f", elapsed)) 秒）"
+            )
+            let launches = await worker.launchCount
+            check(launches == 1, "沈黙で worker を作り直さない（\(launches) 回起動）")
+            let transcript = try await worker.transcribe(id: finalID)
+            check(!transcript.text.isEmpty, "worker は生きていて最終が成功する")
+            await worker.shutdown()
+        } catch {
+            print("  FAIL preview-silent: \(SpeechWorkerClient.message(of: error))")
+            failures += 1
+        }
+
+        print(failures == 0 ? "偽 worker との往復: 全件 ok" : "偽 worker との往復: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
+    /// 自分自身の実行ファイル。偽 worker として起動する（設計書 9.1）。
+    private static func selfExecutablePath() -> String? {
+        let manager = FileManager.default
+        if let path = Bundle.main.executablePath, manager.isExecutableFile(atPath: path) {
+            return path
+        }
+        let argument = CommandLine.arguments[0]
+        if manager.isExecutableFile(atPath: argument) { return argument }
+        let resolved = URL(fileURLWithPath: manager.currentDirectoryPath)
+            .appendingPathComponent(argument).path
+        return manager.isExecutableFile(atPath: resolved) ? resolved : nil
     }
 
     /// 同期の `main` から1つの非同期処理を走らせる。

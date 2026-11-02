@@ -12,6 +12,11 @@ struct HinoVoiceApp {
         if let mode = arguments.first, mode.hasPrefix("--selftest") {
             exit(SelfTest.run(mode: mode, arguments: Array(arguments.dropFirst())))
         }
+        // `--selftest-preview-worker` が自分自身を worker として起動する隠しモード
+        // （設計書 9.1）。シェル script を増やさないので署名もバンドルも変わらない。
+        if arguments.first == "--fake-worker" {
+            exit(FakeWorker.run(scenario: arguments.count > 1 ? arguments[1] : ""))
+        }
 
         let application = NSApplication.shared
         let delegate = AppDelegate()
