@@ -56,12 +56,16 @@ install: sign
 	@echo "installed: $(INSTALLED)"
 
 verify:
+	@mkdir -p $(BUILD_DIR)
 	@echo "--- codesign --verify --strict ---"
 	codesign --verify --strict --verbose=2 "$(INSTALLED)"
 	@echo "--- codesign -d --verbose=4 (TeamIdentifier) ---"
 	@codesign -d --verbose=4 "$(INSTALLED)" 2>&1 | grep -E '^(Identifier|TeamIdentifier|CodeDirectory|Signature)'
 	@echo "--- designated requirement ---"
-	@codesign -d -r- "$(INSTALLED)" 2>/dev/null | grep '^designated' | tee $(BUILD_DIR)/.dr.actual
+	@codesign -d -r- "$(INSTALLED)" 2>/dev/null | tr '\n' ' ' \
+	  | sed -e 's/.*designated =>/designated =>/' -e 's/[[:space:]][[:space:]]*/ /g' -e 's/ *$$//' \
+	  > $(BUILD_DIR)/.dr.actual
+	@cat $(BUILD_DIR)/.dr.actual && echo
 	@if [ "$$(cat $(BUILD_DIR)/.dr.actual)" = '$(EXPECTED_DR)' ]; then \
 	  echo "OK: DR は Team ID $(TEAM_ID) で固定されている"; \
 	else \
