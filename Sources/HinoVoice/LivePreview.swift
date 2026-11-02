@@ -66,13 +66,18 @@ final class LivePreviewSession {
     }
 
     /// 録音ごとに1回（設計書 8.1）。
-    func logSummary(finalDelayMilliseconds: Int) {
+    ///
+    /// `cancelWriteMilliseconds` は、走っているプレビューへ `cancel` の行を
+    /// 書き終えるまでの時間である。エンコーダの停止待ちや最終の文字起こしへの
+    /// 上乗せは含まない。上乗せは同じ音声でプレビューの有無を比べて測る
+    /// （レビュー SHOULD 5）。
+    func logSummary(cancelWriteMilliseconds: Int) {
         guard schedule.roundCount > 0 || schedule.failureCount > 0 else { return }
         Log.state.notice("""
         preview rounds=\(self.schedule.roundCount, privacy: .public), \
         interval=\(self.schedule.minimumInterval ?? 0, privacy: .public)-\
         \(self.schedule.maximumInterval ?? 0, privacy: .public) s, \
-        final_delay=\(finalDelayMilliseconds, privacy: .public) ms, \
+        cancel_write_ms=\(cancelWriteMilliseconds, privacy: .public), \
         failures=\(self.schedule.failureCount, privacy: .public)
         """)
     }

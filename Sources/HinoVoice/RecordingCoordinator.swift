@@ -331,15 +331,15 @@ final class RecordingCoordinator {
             // 60 秒の音声で約 0.64 秒の上乗せになる（設計書 5.1、5.3）。
             // `cancel` 行は小さく、書けた時点で返る（終端は待たない）。順序を
             // actor 内で確定させるため fire-and-forget にしない。
-            var previewDelay = 0
+            var cancelWrite = 0
             if let previewID {
                 let cancelStarted = Date()
                 await worker.cancel(id: previewID)
-                previewDelay = Int(Date().timeIntervalSince(cancelStarted) * 1000)
+                cancelWrite = Int(Date().timeIntervalSince(cancelStarted) * 1000)
             }
             // 再開地点なので世代を照合する。
             guard isCurrent(session) else { return }
-            preview?.logSummary(finalDelayMilliseconds: previewDelay)
+            preview?.logSummary(cancelWriteMilliseconds: cancelWrite)
 
             await sender?.finish(tail)
             // Esc は await の前に世代を無効化する。再開地点ごとに照合して、
@@ -423,7 +423,7 @@ final class RecordingCoordinator {
         self.preview = nil
         preview?.hide()
         preview?.stopScheduling()
-        preview?.logSummary(finalDelayMilliseconds: 0)
+        preview?.logSummary(cancelWriteMilliseconds: 0)
         _ = capture?.stop()
         capture = nil
         sender?.stop()
