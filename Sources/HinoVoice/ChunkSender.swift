@@ -10,6 +10,8 @@ final class ChunkSender: @unchecked Sendable {
         var items: [Data] = []
         var nextSeq = 0
         var draining = false
+        /// 取り消したあと。積んだ分を捨て、以降は何も送らない。
+        var stopped = false
     }
 
     private let worker: SpeechWorkerClient
@@ -27,6 +29,7 @@ final class ChunkSender: @unchecked Sendable {
 
     func send(_ pcm: Data) {
         let shouldDrain = queue.withLock { state -> Bool in
+            guard !state.stopped else { return false }
             state.items.append(pcm)
             if state.draining { return false }
             state.draining = true
@@ -36,10 +39,19 @@ final class ChunkSender: @unchecked Sendable {
         Task { await drain() }
     }
 
+    /// Esc で取り消したときに呼ぶ。積んだ chunk を捨て、走っている drain を
+    /// 次の区切りで終わらせる。取り消したあとに送り続けないため（設計書 12.5）。
+    func stop() {
+        queue.withLock { state in
+            state.items.removeAll()
+            state.stopped = true
+        }
+    }
+
     /// 端数の chunk を積み、`transcribe` の前に全部送り終えるまで待つ（設計書 11）。
     func finish(_ tail: Data) async {
         if !tail.isEmpty { send(tail) }
-        while queue.withLock({ $0.draining }) {
+        while queue.withLock({ $0.draining && !$0.stopped }) {
             try? await Task.sleep(for: .milliseconds(5))
         }
     }
@@ -47,7 +59,7 @@ final class ChunkSender: @unchecked Sendable {
     private func drain() async {
         while true {
             let next = queue.withLock { state -> (Data, Int)? in
-                guard !state.items.isEmpty else {
+                guard !state.stopped, !state.items.isEmpty else {
                     state.draining = false
                     return nil
                 }

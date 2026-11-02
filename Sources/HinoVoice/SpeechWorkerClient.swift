@@ -43,6 +43,10 @@ actor SpeechWorkerClient {
     private var consecutiveFailures = 0
     private var isReady = false
     private var stopping = false
+    /// 起動ごとに増やす世代。終了通知や標準出力のコールバックは、どのプロセスの
+    /// ものか分からないまま状態を変えてはいけない。遅れて届いた旧プロセスの通知が
+    /// 新しいプロセスの待機を壊さないよう、世代が現行のときだけ作用させる。
+    private var launchGeneration = 0
 
     init(onStatus: @escaping @Sendable (WorkerStatus) -> Void) {
         self.onStatus = onStatus
@@ -133,6 +137,8 @@ actor SpeechWorkerClient {
 
     private func launch() async throws {
         let executable = try Self.locateExecutable()
+        launchGeneration += 1
+        let generation = launchGeneration
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = ["worker", AppConfiguration.model]
@@ -156,13 +162,19 @@ actor SpeechWorkerClient {
         errors.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            // stderr は private のまま debug で流す（設計書 14）。
-            Log.worker.debug("stderr: \(String(decoding: data, as: UTF8.self), privacy: .private)")
-            Task { await self?.noteActivity() }
+            // stderr に何が流れるかは保証されないので、長さだけを public で出し、
+            // 本文は `stderrLogByteLimit` バイトの先頭だけを private で流す
+            // （設計書 14）。全文を転送すると、無記録を保証できない。
+            let head = data.prefix(AppConfiguration.stderrLogByteLimit)
+            Log.worker.debug("""
+            stderr \(data.count, privacy: .public) bytes: \
+            \(String(decoding: head, as: UTF8.self), privacy: .private)
+            """)
+            Task { await self?.noteActivity(generation: generation) }
         }
         process.terminationHandler = { [weak self] finished in
             Log.worker.notice("worker exit status \(finished.terminationStatus, privacy: .public)")
-            Task { await self?.resumeTermination() }
+            Task { await self?.resumeTermination(generation: generation) }
         }
 
         do {
@@ -174,8 +186,10 @@ actor SpeechWorkerClient {
         self.process = process
         writer = PipeWriter(handle: input.fileHandleForWriting)
         readySettled = nil
-        noteActivity()
-        readerTask = Task { [weak self] in await self?.readLines(from: stdoutData) }
+        noteActivity(generation: generation)
+        readerTask = Task { [weak self] in
+            await self?.readLines(from: stdoutData, generation: generation)
+        }
         try await waitReady()
     }
 
@@ -220,7 +234,8 @@ actor SpeechWorkerClient {
         Date().timeIntervalSince(lastActivity)
     }
 
-    private func noteActivity() {
+    private func noteActivity(generation: Int) {
+        guard generation == launchGeneration else { return }
         lastActivity = Date()
     }
 
@@ -233,7 +248,12 @@ actor SpeechWorkerClient {
         continuation.resume(with: result)
     }
 
-    private func resumeTermination() {
+    private func resumeTermination(generation: Int) {
+        guard generation == launchGeneration else {
+            // 旧プロセスの終了通知。新しいプロセスの待機は壊さない。
+            Log.worker.debug("ignored termination notice from a previous worker")
+            return
+        }
         failAllPending(WorkerFailure.terminated)
         finishReady(.failure(WorkerFailure.terminated))
         guard let continuation = terminationContinuation else { return }
@@ -278,30 +298,46 @@ actor SpeechWorkerClient {
 
     // MARK: 標準出力
 
-    private func readLines(from stream: AsyncStream<Data>) async {
+    private func readLines(from stream: AsyncStream<Data>, generation: Int) async {
         var buffer = Data()
         for await data in stream {
-            noteActivity()
+            noteActivity(generation: generation)
             buffer.append(data)
             while let index = buffer.firstIndex(of: UInt8(ascii: "\n")) {
                 let line = Data(buffer[buffer.startIndex ..< index])
                 buffer.removeSubrange(buffer.startIndex ... index)
-                if !line.isEmpty { handle(line: line) }
+                handle(line: line, generation: generation)
             }
+        }
+        // 改行で終わらない残りは、途中で切れた行である。読み捨てるとプロトコルが
+        // ずれたまま進むので、worker の欠陥として扱う（設計書 12.3）。
+        if !buffer.isEmpty, !stopping {
+            violate("改行で終わらない行", generation: generation)
         }
     }
 
-    private func handle(line: Data) {
+    /// 解釈できない行はスキップせず、worker の欠陥として扱って再起動する
+    /// （設計書 12.3、worker-protocol.md「stdout carries the protocol and nothing else」）。
+    private func violate(_ detail: String, generation: Int) {
+        guard generation == launchGeneration else { return }
+        Log.worker.error("protocol violation on stdout, restarting worker")
+        let failure = WorkerFailure.protocolViolation(detail)
+        finishReady(.failure(failure))
+        failAllPending(failure)
+        process?.terminate()
+    }
+
+    private func handle(line: Data, generation: Int) {
+        guard generation == launchGeneration else { return }
+        guard !line.isEmpty else {
+            violate("空の行", generation: generation)
+            return
+        }
         let message: WorkerProtocol.Incoming
         do {
             message = try WorkerProtocol.decode(line: line)
         } catch {
-            // 解釈できない行はスキップせず、worker の欠陥として扱う（設計書 12.3）。
-            Log.worker.error("protocol violation on stdout, restarting worker")
-            let failure = WorkerFailure.protocolViolation("JSON オブジェクトでない行")
-            finishReady(.failure(failure))
-            failAllPending(failure)
-            process?.terminate()
+            violate("JSON オブジェクトでない行", generation: generation)
             return
         }
 
@@ -313,11 +349,40 @@ actor SpeechWorkerClient {
             Log.worker.error("worker fatal: \(failure.code, privacy: .public)")
             finishReady(.failure(failure))
         case "progress":
-            if let id = message.id { touch(id) }
+            // progress は走っているリクエストに付く。id のない progress は
+            // どのリクエストの沈黙を測っているのか決められない。
+            guard let id = message.id else {
+                violate("id のない progress", generation: generation)
+                return
+            }
+            touch(id)
         case "end":
-            guard let id = message.id else { return }
-            deliver(id: id, .success(.end(text: message.text ?? "", stop: message.stop ?? "complete")))
+            guard let id = message.id else {
+                violate("id のない end", generation: generation)
+                return
+            }
+            guard pending[id] != nil else {
+                // 終端のあとに来た行、または呼び出し側が降りたリクエスト
+                // （設計書 12.3）。必須の member は待っている分だけ確かめる。
+                // `info` や `count_tokens` の end は text も stop も持たない。
+                Log.worker.debug("terminal for unknown request")
+                return
+            }
+            // このアプリが出すのは認識リクエストだけなので、その end は text と
+            // stop を必ず持つ（worker-protocol.md）。欠けた値を空文字や
+            // complete で補うと、失敗を成功として貼ってしまう。
+            guard let text = message.text, let stop = message.stop else {
+                violate("text か stop が欠けた end", generation: generation)
+                return
+            }
+            deliver(id: id, .success(.end(text: text, stop: stop)))
         case "error":
+            // id のない error は、どのリクエストにも結び付かない行への応答として
+            // 文書が認めている。code は必須。
+            guard let code = message.error?.code, !code.isEmpty else {
+                violate("code のない error", generation: generation)
+                return
+            }
             let failure = Self.failure(from: message.error)
             if let id = message.id {
                 deliver(id: id, .failure(failure))
@@ -325,7 +390,11 @@ actor SpeechWorkerClient {
                 Log.worker.error("worker error without id: \(failure.code, privacy: .public)")
             }
         case "cancelled":
-            if let id = message.id { deliver(id: id, .success(.cancelled)) }
+            guard let id = message.id else {
+                violate("id のない cancelled", generation: generation)
+                return
+            }
+            deliver(id: id, .success(.cancelled))
         default:
             // message が増えても protocol は上がらない。知らない type は無視する。
             Log.worker.debug("ignored message type \(message.type, privacy: .public)")
@@ -397,9 +466,15 @@ actor SpeechWorkerClient {
     }
 
     /// Esc で取り消す。文書のとおり `transcribe` は送らない（設計書 12.5）。
+    ///
+    /// 表から先に外す。録音中の取り消しでは `waitTerminal` が呼ばれていないので、
+    /// 終端を預けると誰も引き取らず `pending` に残り続ける。外したあとに届く
+    /// `cancelled` や `end` は、終端のあとに来た行として無視される（設計書 12.3）。
     func cancel(id: String) async {
+        if let request = pending.removeValue(forKey: id), let continuation = request.continuation {
+            continuation.resume(throwing: WorkerFailure.cancelled)
+        }
         try? await write(WorkerProtocol.cancelLine(id: id))
-        deliver(id: id, .failure(WorkerFailure.cancelled))
     }
 
     private func waitTerminal(id: String) async throws -> WorkerProtocol.Terminal {
