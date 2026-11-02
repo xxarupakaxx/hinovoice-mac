@@ -121,6 +121,13 @@ final class RecordingCoordinator {
     private var target: PasteTarget?
     private var limitTask: Task<Void, Never>?
     private var tapInstalled = false
+    /// 録音中のライブプレビュー（設計書 4〜6）。パネルは最初の録音で作って使い回す。
+    private var previewPanel: PreviewPanel?
+    private var preview: LivePreviewSession?
+
+    /// プレビューの3段目に使うメニューバー項目の位置（設計書 6.2）。
+    /// 項目を持つのは `MenuBarController` なので、起動時に渡してもらう。
+    var menuBarFrame: (() -> CGRect?)?
 
     private var generation = SessionGeneration()
     /// 開始処理が走っている間。マイクの許可待ちと `newRequest` の待ちの間も
@@ -274,6 +281,19 @@ final class RecordingCoordinator {
         self.capture = capture
         transition(to: .recording)
 
+        let panel = previewPanel ?? PreviewPanel()
+        previewPanel = panel
+        let preview = LivePreviewSession(
+            worker: worker,
+            capture: capture,
+            panel: panel,
+            target: target,
+            menuBarFrame: { [weak self] in self?.menuBarFrame?() },
+            isRecording: { [weak self] in self?.state == .recording }
+        )
+        self.preview = preview
+        preview.start()
+
         limitTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(AppConfiguration.maxRecordingSeconds))
             guard !Task.isCancelled else { return }
@@ -284,6 +304,15 @@ final class RecordingCoordinator {
     private func stopAndTranscribe() async {
         guard state == .recording, let id = requestID, let capture else { return }
         let session = generation.current
+        // 最初の `await` より前に、同期でプレビューを畳む（設計書 5.3）。
+        // 1. ウィンドウを隠す。貼り付け先の問い合わせより前に画面から消す（設計書 6.4）
+        // 2. 予約を止める。以降は新しいラウンドを作らない
+        // 3. `.transcribing` へ移る
+        let preview = self.preview
+        self.preview = nil
+        preview?.hide()
+        preview?.stopScheduling()
+        let previewID = preview?.requestID
         limitTask?.cancel()
         limitTask = nil
         let tail = capture.stop()
@@ -297,6 +326,21 @@ final class RecordingCoordinator {
 
         let started = Date()
         do {
+            // 走っているプレビューを止める。worker は要求を直列に処理するので、
+            // これを出さないと最終の `transcribe` がプレビューの終わりを待ち、
+            // 60 秒の音声で約 0.64 秒の上乗せになる（設計書 5.1、5.3）。
+            // `cancel` 行は小さく、書けた時点で返る（終端は待たない）。順序を
+            // actor 内で確定させるため fire-and-forget にしない。
+            var previewDelay = 0
+            if let previewID {
+                let cancelStarted = Date()
+                await worker.cancel(id: previewID)
+                previewDelay = Int(Date().timeIntervalSince(cancelStarted) * 1000)
+            }
+            // 再開地点なので世代を照合する。
+            guard isCurrent(session) else { return }
+            preview?.logSummary(finalDelayMilliseconds: previewDelay)
+
             await sender?.finish(tail)
             // Esc は await の前に世代を無効化する。再開地点ごとに照合して、
             // 取り消したあとの結果を貼らない。
@@ -312,6 +356,7 @@ final class RecordingCoordinator {
             stop=\(transcript.stop, privacy: .public), \
             \(transcript.text.count, privacy: .public) characters
             """)
+            preview?.noteFinal(transcript.text)
             requestID = nil
             sender = nil
             // 貼り付けの予約は await を挟む前に済ませる。`paste` の中で印を
@@ -360,12 +405,25 @@ final class RecordingCoordinator {
         transition(to: .idle)
     }
 
+    /// 畳んだセッションが worker に残している id。
+    private struct CancelledSession {
+        var requestID: String?
+        var previewID: String?
+
+        var isEmpty: Bool { requestID == nil && previewID == nil }
+    }
+
     /// 取り消しの同期部分。`await` を1つも含まないので、呼び出し元へ戻った
-    /// 時点で古いセッションの結果は貼られない。
-    private func invalidateSession() -> String? {
+    /// 時点で古いセッションの結果は貼られず、プレビューも画面から消えている。
+    private func invalidateSession() -> CancelledSession {
         generation.invalidate()
         limitTask?.cancel()
         limitTask = nil
+        let preview = self.preview
+        self.preview = nil
+        preview?.hide()
+        preview?.stopScheduling()
+        preview?.logSummary(finalDelayMilliseconds: 0)
         _ = capture?.stop()
         capture = nil
         sender?.stop()
@@ -374,12 +432,18 @@ final class RecordingCoordinator {
         let id = requestID
         requestID = nil
         transition(to: .idle)
-        return id
+        return CancelledSession(requestID: id, previewID: preview?.requestID)
     }
 
     private func cancelSession() {
-        guard let id = invalidateSession() else { return }
-        Task { [worker] in await worker.cancel(id: id) }
+        let cancelled = invalidateSession()
+        guard !cancelled.isEmpty else { return }
+        Task { [worker] in
+            // プレビューを先に畳む。走っているプレビューの後ろで録音 id の
+            // `cancel` が待つ理由はない（設計書 5.1）。
+            if let previewID = cancelled.previewID { await worker.cancel(id: previewID) }
+            if let id = cancelled.requestID { await worker.cancel(id: id) }
+        }
     }
 
     private func isCurrent(_ session: Int) -> Bool {
@@ -406,6 +470,9 @@ final class RecordingCoordinator {
         workerStatus = status
         switch status {
         case let .unavailable(reason):
+            // worker が使えなくなったらプレビューは画面に残さない（設計書 8.2）。
+            preview?.hide()
+            preview?.stopScheduling()
             transition(to: .unavailable(reason))
         case .ready:
             if case .unavailable = state {

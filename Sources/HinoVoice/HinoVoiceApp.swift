@@ -33,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator.onPresentation = { presentation in
             menu.apply(presentation)
         }
+        coordinator.menuBarFrame = { [weak menu] in menu?.statusItemFrame }
         coordinator.start()
         Log.app.notice("launched")
     }
