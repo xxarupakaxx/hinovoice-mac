@@ -74,4 +74,53 @@ enum AppConfiguration {
     /// アクセシビリティの問い合わせの待ち時間。応答しないアプリで貼り付けが
     /// 固まらないようにする。
     static let axMessagingTimeoutSeconds = 0.2
+
+    // MARK: 録音中のライブプレビュー
+
+    /// 間隔は `clamp(蓄積秒数 / 20, 1, 3)`（設計書 4.1）。20 秒までは毎秒、
+    /// 40 秒で 2 秒、60 秒で 3 秒になる。実機で遅れが気になればこの分母を
+    /// 大きくし、1 Hz 固定へ寄せる。
+    static let previewIntervalDivisor = 20.0
+    static let previewMinIntervalSeconds = 1.0
+    static let previewMaxIntervalSeconds = 3.0
+
+    /// プレビューが沈黙したと見なす長さ。観測した最悪の往復 1.15 秒の約3倍
+    /// （設計書 8.2）。最終の 20 秒とは別の値にする。
+    static let previewIdleTimeoutSeconds = 3.0
+    /// これだけ連続で失敗したら、その録音のプレビューを止める（設計書 8.2）。
+    static let maxConsecutivePreviewFailures = 3
+    /// これより短い蓄積ではラウンドを作らない。
+    static let previewMinimumSeconds = 0.5
+
+    /// 表示の上限（設計書 3.3）。超えた分は先頭を落とす。
+    static let previewCharacterLimit = 120
+    static let previewMaxLines = 2
+    static let previewMaxWidth = 420.0
+    /// 画面の見える範囲から残す余白。幅は `min(420, visibleFrame.width - 32)`。
+    static let previewScreenInset = 32.0
+    /// 基準の矩形からの距離。
+    static let previewGap = 6.0
+    static let previewHorizontalPadding = 10.0
+    static let previewVerticalPadding = 7.0
+    static let previewCornerRadius = 8.0
+    static let previewBorderWidth = 0.5
+    static let previewFontSize = 13.0
+    /// フォーカスウィンドウの左下の内側に置くときの差し込み（設計書 6.2 の2段目）。
+    static let previewWindowInset = 12.0
+
+    /// キャレットの矩形を取るための属性名。SDK の定数文字列は
+    /// `AXAttributeConstants.h` で実値を確認している。`kAX...` のグローバルは
+    /// Swift 6 から参照できないので、既存の同 70-72 と同じく文字列で置く。
+    static let axSelectedTextRangeAttribute = "AXSelectedTextRange"
+    static let axBoundsForRangeAttribute = "AXBoundsForRange"
+    static let axPositionAttribute = "AXPosition"
+    static let axSizeAttribute = "AXSize"
+
+    /// プレビュー専用の問い合わせの待ち時間。貼り付け判定の 0.2 秒を流用すると、
+    /// 応答しないアプリで毎秒 0.4 秒メインスレッドを止める。プレビューは
+    /// 見栄えの話なので短く切る（設計書 6.2）。
+    static let previewAXMessagingTimeoutSeconds = 0.05
+    /// これだけ連続でキャレットもウィンドウも取れなければ、そのセッションは
+    /// メニューバーの段に固定する（設計書 6.2）。
+    static let maxConsecutiveCaretFailures = 3
 }
