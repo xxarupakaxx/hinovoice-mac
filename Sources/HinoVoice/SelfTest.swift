@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 import os
 
@@ -10,15 +11,20 @@ enum SelfTest {
         switch mode {
         case "--selftest-keys":
             return keys()
+        case "--selftest-session":
+            return session()
         case "--selftest-clipboard":
             return clipboard()
         case "--selftest-audio":
             return audio(arguments)
+        case "--selftest-downmix":
+            return downmix()
         case "--selftest-worker":
             return blocking { await worker(arguments) }
         default:
-            print("使い方: HinoVoice --selftest-keys | --selftest-clipboard"
-                + " | --selftest-audio <in.wav> <out.wav> | --selftest-worker <in.wav>")
+            print("使い方: HinoVoice --selftest-keys | --selftest-session | --selftest-clipboard"
+                + " | --selftest-audio <in.wav> <out.wav> | --selftest-downmix"
+                + " | --selftest-worker <in.wav>")
             return 2
         }
     }
@@ -124,7 +130,106 @@ enum SelfTest {
             "待機中に通した Enter は、録音中になってから離しても通す"
         )
 
+        // 修飾キーを先に離す場合。⌃⌥Space の Control と Option を離してから
+        // Space を離すと、keyUp の修飾状態は空になる。役割で照合すると `.other`
+        // になって keyUp が漏れ、開始キーの捕捉状態も残る（レビュー MUST 4）。
+        var released = TapState(swallowsConfirmKeys: false, acceptsStartKey: true)
+        check(
+            KeyPolicy.decide(start(true), state: &released) == KeyDecision(swallow: true, event: .start),
+            "⌃⌥Space を飲み込んで開始する"
+        )
+        released.acceptsStartKey = false // 録音中へ遷移した
+        check(
+            KeyPolicy.decide(
+                KeyInput(keyCode: 49, flags: [], isKeyDown: false, isRepeat: false),
+                state: &released
+            ) == KeyDecision(swallow: true, event: nil),
+            "Control と Option を先に離しても Space の keyUp を飲み込む"
+        )
+        released.acceptsStartKey = true // 待機中へ戻った
+        check(
+            KeyPolicy.decide(start(true), state: &released) == KeyDecision(swallow: true, event: .start),
+            "捕捉状態が残らないので次の ⌃⌥Space も開始できる"
+        )
+
+        // Option だけを離した途中の状態でも同じこと。
+        var partly = TapState(swallowsConfirmKeys: false, acceptsStartKey: true)
+        _ = KeyPolicy.decide(start(true), state: &partly)
+        check(
+            KeyPolicy.decide(
+                KeyInput(keyCode: 49, flags: [.maskControl], isKeyDown: false, isRepeat: false),
+                state: &partly
+            ) == KeyDecision(swallow: true, event: nil),
+            "Option だけ離した状態の Space の keyUp も飲み込む"
+        )
+
+        // Return とテンキーの Enter は別の物理キーである。片方の keyUp で
+        // もう片方の捕捉状態を消してはいけない（レビュー MUST 4）。
+        var both = TapState(swallowsConfirmKeys: true, acceptsStartKey: false)
+        check(
+            KeyPolicy.decide(enter(true), state: &both) == KeyDecision(swallow: true, event: .confirm),
+            "Return を飲み込んで確定する"
+        )
+        check(
+            KeyPolicy.decide(numpadEnter(false), state: &both) == passthrough,
+            "飲み込んでいないテンキー Enter の keyUp は通す"
+        )
+        check(
+            KeyPolicy.decide(enter(false), state: &both) == KeyDecision(swallow: true, event: nil),
+            "Return の keyUp はそのあとでも飲み込む"
+        )
+        check(
+            KeyPolicy.decide(numpadEnter(true), state: &both) == KeyDecision(swallow: true, event: .confirm),
+            "テンキー Enter は Return とは別に捕捉する"
+        )
+        check(
+            KeyPolicy.decide(
+                KeyInput(keyCode: 76, flags: [.maskShift], isKeyDown: false, isRepeat: false),
+                state: &both
+            ) == KeyDecision(swallow: true, event: nil),
+            "Shift を押しながら離したテンキー Enter の keyUp も飲み込む"
+        )
+
         print(failures == 0 ? "キーの判定: 全件 ok" : "キーの判定: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: Esc と認識完了の競合
+
+    /// 取り消しは `await` の前に世代を進める。再開地点で照合すれば、取り消した
+    /// あとに届いた結果は貼られず、古い処理の後始末は新しいセッションに触れない
+    /// （レビュー MUST 2）。
+    private static func session() -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+
+        var generation = SessionGeneration()
+        let first = generation.begin()
+        check(generation.isCurrent(first), "始めた世代は有効")
+
+        // Esc。worker へ cancel を送る前に無効化する。
+        generation.invalidate()
+        check(!generation.isCurrent(first), "取り消したあと、録音中の世代は無効")
+
+        // 競合していた end がここで届く。貼り付けへ進んではいけない。
+        check(!generation.isCurrent(first), "取り消しのあとに届いた結果は貼らない")
+
+        // 取り消し直後に次の録音を始める。
+        let second = generation.begin()
+        check(generation.isCurrent(second), "次の録音の世代は有効")
+        check(!generation.isCurrent(first), "古い世代は新しい録音と一致しない")
+
+        // 遅れてきた古い処理の後始末が、新しいセッションを消さないこと。
+        check(first != second, "世代は再利用しない")
+        generation.invalidate()
+        check(!generation.isCurrent(second), "新しい録音も取り消せる")
+        let third = generation.begin()
+        check(third != first && third != second, "世代は常に新しい値になる")
+
+        print(failures == 0 ? "セッションの世代: 全件 ok" : "セッションの世代: \(failures) 件 FAIL")
         return failures == 0 ? 0 : 1
     }
 
@@ -165,9 +270,94 @@ enum SelfTest {
         )
         check(pasteboard.string(forType: .string) == "EXTERNAL-COPY", "新しい内容を消さない")
 
+        // 保存から消去までの間に外部のコピーが入る場合。消すとユーザーが意図して
+        // コピーした内容を失うので、消す前に照合して中止する（レビュー SHOULD 11）。
+        pasteboard.clearContents()
+        pasteboard.setString("SELFTEST-BEFORE-CLEAR", forType: .string)
+        let third = ClipboardSnapshot.capture(from: pasteboard)
+        check(third.isCurrent(on: pasteboard), "保存した直後は消去してよい")
+        pasteboard.clearContents()
+        pasteboard.setString("EXTERNAL-COPY-WHILE-SAVING", forType: .string)
+        check(!third.isCurrent(on: pasteboard), "保存のあとに変わっていれば消去しない")
+        check(
+            pasteboard.string(forType: .string) == "EXTERNAL-COPY-WHILE-SAVING",
+            "中止したので新しい内容が残っている"
+        )
+
         _ = entry.restore(to: pasteboard, ifChangeCountIs: pasteboard.changeCount)
         print(failures == 0 ? "クリップボード: 全件 ok" : "クリップボード: \(failures) 件 FAIL")
         return failures == 0 ? 0 : 1
+    }
+
+    // MARK: ステレオのミックスダウン
+
+    /// 片側のチャンネルにだけ信号がある 48kHz ステレオ入力を変換する。
+    /// `downmix` が無効だとチャンネルの配置替えになり、無音側を取る並びでは
+    /// 音声が丸ごと落ちる（レビュー MUST 6）。
+    private static func downmix() -> Int32 {
+        var failures = 0
+        func check(_ passed: Bool, _ label: String) {
+            print(passed ? "  ok   \(label)" : "  FAIL \(label)")
+            if !passed { failures += 1 }
+        }
+
+        let sampleRate = 48000.0
+        let frames = AVAudioFrameCount(sampleRate / 2) // 0.5 秒
+        guard let stereo = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 2,
+            interleaved: false
+        ) else {
+            print("  FAIL 48kHz ステレオの形式を作れない")
+            return 1
+        }
+
+        for loud in 0 ... 1 {
+            guard let input = AVAudioPCMBuffer(pcmFormat: stereo, frameCapacity: frames),
+                  let channels = input.floatChannelData
+            else {
+                print("  FAIL 入力バッファを作れない")
+                return 1
+            }
+            input.frameLength = frames
+            for frame in 0 ..< Int(frames) {
+                let phase = 2.0 * Double.pi * 440.0 * Double(frame) / sampleRate
+                channels[loud][frame] = Float(sin(phase) * 0.5)
+                channels[1 - loud][frame] = 0
+            }
+
+            let side = loud == 0 ? "左" : "右"
+            do {
+                let resampler = try AudioResampler(inputFormat: stereo)
+                var pcm = resampler.convert(input)
+                pcm.append(resampler.flush())
+                check(pcm.count > 0, "\(side)だけに信号がある入力を変換できる")
+                let peak = peakAmplitude(of: pcm)
+                print("  \(side)チャンネルのみ: \(pcm.count) バイト, 最大振幅 \(String(format: "%.3f", peak))")
+                check(peak > 0.05, "\(side)だけの信号がミックスダウンで残る")
+            } catch {
+                print("  FAIL \(side)チャンネルの変換に失敗: \(error)")
+                failures += 1
+            }
+        }
+
+        print(failures == 0 ? "ミックスダウン: 全件 ok" : "ミックスダウン: \(failures) 件 FAIL")
+        return failures == 0 ? 0 : 1
+    }
+
+    /// 16bit リトルエンディアンのモノラル PCM の最大振幅（0〜1）。
+    private static func peakAmplitude(of pcm: Data) -> Double {
+        var peak = 0
+        var offset = pcm.startIndex
+        while offset + 1 < pcm.endIndex {
+            let low = UInt16(pcm[offset])
+            let high = UInt16(pcm[offset + 1]) << 8
+            let sample = Int(Int16(bitPattern: high | low))
+            peak = max(peak, abs(sample))
+            offset += 2
+        }
+        return Double(peak) / Double(Int16.max)
     }
 
     // MARK: 16kHz モノラル変換
@@ -226,8 +416,9 @@ enum SelfTest {
             let started = Date()
             let transcript = try await client.transcribe(id: id)
             let elapsed = Date().timeIntervalSince(started)
+            // 本文は出さない。長さと成否だけで往復が成立したことは分かる（設計書 14）。
             print("  transcribe: \(String(format: "%.2f", elapsed)) 秒, stop=\(transcript.stop)")
-            print("  text: \(transcript.text)")
+            print("  text: \(transcript.text.count) 文字")
             await client.shutdown()
             guard !transcript.text.isEmpty else {
                 print("worker との往復: FAIL（結果が空）")
