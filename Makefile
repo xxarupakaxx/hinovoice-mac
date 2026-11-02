@@ -7,7 +7,9 @@
 
 APP_NAME    := HinoVoice
 BUNDLE_ID   := com.xxarupakaxx.hinovoice-mac
-TEAM_ID     := BZHZY5UCL3
+# codesign -d --verbose=4 の TeamIdentifier から読み取った値。証明書の名前に
+# 括弧で入っている文字列とは別物なので、名前から推測してはいけない。
+TEAM_ID     := 9HADDY47LK
 
 BUILD_DIR   := build
 APP_BUNDLE  := $(BUILD_DIR)/$(APP_NAME).app
@@ -18,9 +20,13 @@ INSTALLED   := $(INSTALL_DIR)/$(APP_NAME).app
 # 期待する DR。codesign -d -r- が表示する文字列と完全一致させる。
 EXPECTED_DR := designated => identifier "$(BUNDLE_ID)" and anchor apple generic and certificate leaf[subject.OU] = "$(TEAM_ID)"
 
-# 署名 ID は環境のキーチェーンから Team ID で引く。証明書の Common Name
-# （メールアドレスを含む）をリポジトリへ書かないため、ここでは解決しない。
-SIGN_ID ?= $(shell security find-identity -v -p codesigning | awk -F'"' '/Apple Development:.*\($(TEAM_ID)\)/ { print $$2; exit }')
+# 署名 ID は環境のキーチェーンにある Apple Development 証明書から引く。証明書の
+# Common Name（メールアドレスを含む）をリポジトリへ書かないため、名前は指定しない。
+# 証明書の名前に括弧で入っている文字列は Team ID とは別物なので、名前からの
+# 絞り込みにも使わない。複数ある環境では SIGN_ID を明示して渡す。
+# Team ID が合っているかどうかは、署名後に make verify が照合する。
+SIGN_ID ?= $(shell security find-identity -v -p codesigning | awk -F'"' '/Apple Development:/ { print $$2; exit }')
+SIGN_ID_COUNT := $(shell security find-identity -v -p codesigning | grep -c 'Apple Development:')
 
 TEST_WAV ?= $(HOME)/hinovoice-work/test-ja.wav
 
@@ -43,7 +49,10 @@ bundle: build
 # 付けない（設計書 7.3）。--identifier を明示するのは、SwiftPM が作った
 # バイナリからの識別子推論に頼らないためである（設計書 6.3）。
 sign: bundle
-	@test -n "$(SIGN_ID)" || { echo "FAIL: Team ID $(TEAM_ID) の Apple Development 証明書が見つかりません"; exit 1; }
+	@test -n "$(SIGN_ID)" || { echo "FAIL: Apple Development 証明書が見つかりません"; exit 1; }
+	@test "$(SIGN_ID_COUNT)" = "1" || { \
+	  echo "FAIL: Apple Development 証明書が $(SIGN_ID_COUNT) 件あります。SIGN_ID=<名前> を指定してください"; \
+	  exit 1; }
 	codesign --force --sign "$(SIGN_ID)" \
 	  --identifier "$(BUNDLE_ID)" \
 	  --requirements '=$(EXPECTED_DR)' \
@@ -70,7 +79,7 @@ verify:
 	  echo "OK: DR は Team ID $(TEAM_ID) で固定されている"; \
 	else \
 	  echo "FAIL: DR が期待値と一致しない"; \
-	  echo "  expected: $(EXPECTED_DR)"; \
+	  echo '  expected: $(EXPECTED_DR)'; \
 	  echo "  actual  : $$(cat $(BUILD_DIR)/.dr.actual)"; \
 	  exit 1; \
 	fi
