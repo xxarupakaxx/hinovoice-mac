@@ -162,14 +162,10 @@ actor SpeechWorkerClient {
         errors.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            // stderr に何が流れるかは保証されないので、長さだけを public で出し、
-            // 本文は `stderrLogByteLimit` バイトの先頭だけを private で流す
-            // （設計書 14）。全文を転送すると、無記録を保証できない。
-            let head = data.prefix(AppConfiguration.stderrLogByteLimit)
-            Log.worker.debug("""
-            stderr \(data.count, privacy: .public) bytes: \
-            \(String(decoding: head, as: UTF8.self), privacy: .private)
-            """)
+            // stderr の中身は Logger へ渡さない。worker が何を出すかは保証されず、
+            // 本文が混ざれば長さ制限や `.private` では無記録を保証できない
+            // （設計書 14、レビュー MUST 8）。記録するのは長さだけである。
+            Log.worker.debug("stderr \(data.count, privacy: .public) bytes")
             Task { await self?.noteActivity(generation: generation) }
         }
         process.terminationHandler = { [weak self] finished in

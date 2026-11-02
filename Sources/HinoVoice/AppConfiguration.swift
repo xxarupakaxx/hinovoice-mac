@@ -51,10 +51,6 @@ enum AppConfiguration {
     static let writePollSliceSeconds = 0.1
     static let shutdownGraceSeconds = 3.0
 
-    /// worker の stderr からログへ流す上限。本文を記録しないため、長い出力は
-    /// 先頭だけにする（設計書 14）。
-    static let stderrLogByteLimit = 200
-
     static let restartBackoffSeconds: [Double] = [1, 2, 4, 8, 16]
     static let restartBackoffCapSeconds = 30.0
     static let maxConsecutiveWorkerFailures = 5

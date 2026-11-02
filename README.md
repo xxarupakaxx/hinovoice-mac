@@ -93,6 +93,8 @@ log stream --predicate 'subsystem == "com.xxarupakaxx.hinovoice-mac"' --level de
 ```
 
 文字起こしの本文、クリップボードの内容、音声データ、マイクのデバイス名はログに出さない。
+worker の stderr の中身もログへ渡さない（記録するのは長さだけである）。そのため、worker が
+出すエラーの文面を見たいときは `speech worker` を端末から直接動かす。
 
 ## 分かっている制約
 
